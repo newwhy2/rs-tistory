@@ -397,17 +397,28 @@ def save_post_html(output_dir, date_str, index_name, title, content_html):
 
 def get_blogger_access_token():
     """OAuth2 refresh token으로 새 access token을 발급받는다."""
+    client_id = GOOGLE_CLIENT_ID.strip()
+    client_secret = GOOGLE_CLIENT_SECRET.strip()
+    refresh_token = GOOGLE_REFRESH_TOKEN.strip()
+
+    print(f"[DEBUG] client_id: {client_id[:20]}..." if client_id else "[DEBUG] client_id: EMPTY!")
+    print(f"[DEBUG] client_secret: {client_secret[:10]}..." if client_secret else "[DEBUG] client_secret: EMPTY!")
+    print(f"[DEBUG] refresh_token: {refresh_token[:20]}..." if refresh_token else "[DEBUG] refresh_token: EMPTY!")
+
     resp = requests.post(
         "https://oauth2.googleapis.com/token",
         data={
-            "client_id": GOOGLE_CLIENT_ID,
-            "client_secret": GOOGLE_CLIENT_SECRET,
-            "refresh_token": GOOGLE_REFRESH_TOKEN,
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh_token,
             "grant_type": "refresh_token",
         },
         timeout=30,
     )
-    resp.raise_for_status()
+    if resp.status_code != 200:
+        print(f"[ERROR] Token refresh failed: {resp.status_code}")
+        print(f"[ERROR] Response: {resp.text}")
+        resp.raise_for_status()
     return resp.json()["access_token"]
 
 
