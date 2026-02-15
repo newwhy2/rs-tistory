@@ -1,6 +1,7 @@
 import os
 import json
 import datetime as dt
+import argparse
 from io import StringIO
 
 import pandas as pd
@@ -22,6 +23,8 @@ BLOGGER_BLOG_ID = os.getenv("BLOGGER_BLOG_ID", "")
 LOOKBACK_DAYS = 260
 TOP_N = 30
 QUALITY_TOP_N = 30
+OUTPUT_DIR_NAME = "output"
+DATA_DIR_NAME = "data"
 
 THEME_ETF_MAP = {
     "Semiconductors": "SMH",
@@ -1125,6 +1128,10 @@ def build_quality_post(date_str: str, quality_df: pd.DataFrame) -> tuple[str, st
     top_df["회사명"] = top_df["Name"]
     top_df["섹터"] = top_df["Sector"]
     top_df["Quality점수"] = top_df["QualityScore"].astype(int)
+    top_df["일간보정"] = top_df.get("daily_adjust", 0).astype(int)
+    top_df["주간보정"] = top_df.get("weekly_adjust", 0).astype(int)
+    top_df["총보정"] = top_df.get("total_adjust_clipped", 0).astype(int)
+    top_df["최종점수"] = top_df.get("FinalQualityScore", top_df["QualityScore"]).astype(int)
     top_df["성장점수"] = top_df["ScoreGrowth"].astype(int)
     top_df["재무점수"] = top_df["ScoreProfitability"].astype(int)
     top_df["수급점수"] = top_df["ScoreLeadership"].astype(int)
@@ -1137,7 +1144,8 @@ def build_quality_post(date_str: str, quality_df: pd.DataFrame) -> tuple[str, st
     display_df = top_df[
         [
             "순위", "티커", "회사명", "섹터",
-            "Quality점수", "성장점수", "재무점수", "수급점수", "차트점수", "유동성점수",
+            "Quality점수", "일간보정", "주간보정", "총보정", "최종점수",
+            "성장점수", "재무점수", "수급점수", "차트점수", "유동성점수",
             "RS등급", "셋업", "DataConfidence",
         ]
     ]
@@ -1171,6 +1179,17 @@ def build_quality_post(date_str: str, quality_df: pd.DataFrame) -> tuple[str, st
   </p>
 </div>
 """
+    adjustment_html = """
+<div style="margin:10px 0;padding:15px;border:1px solid #e0e0e0;border-radius:10px;background-color:#f8fbff;">
+  <h3 style="margin:0 0 10px 0;color:#333;">정성 보정 규칙 (±5)</h3>
+  <ul style="margin:0;padding-left:18px;line-height:1.7;">
+    <li>일간 Agent 신호: 방향(+/-)과 신뢰도(confidence) 기반으로 종목당 -3 ~ +3</li>
+    <li>주간 Deep 컨텍스트: 섹터/테마 확증 기반으로 종목당 -2 ~ +2</li>
+    <li>총보정 = clip(일간보정 + 주간보정, -5, +5)</li>
+    <li>최종점수 = Quality점수 + 총보정</li>
+  </ul>
+</div>
+"""
     disclaimer_html = """
 <p style="font-size:12px;color:#888;margin-top:20px;">
 <em>※ 본 글은 특정 종목의 매수/매도 추천이 아니며, 정보 제공만을 목적으로 합니다. 투자 판단의 책임은 투자자에게 있습니다.</em>
@@ -1181,6 +1200,7 @@ def build_quality_post(date_str: str, quality_df: pd.DataFrame) -> tuple[str, st
         style_html
         + intro_html
         + formula_html
+        + adjustment_html
         + f'<h3>Quality Top {QUALITY_TOP_N}</h3>'
         + f'<div class="rs-table-wrap">{table_html}</div>'
         + disclaimer_html
@@ -1188,21 +1208,278 @@ def build_quality_post(date_str: str, quality_df: pd.DataFrame) -> tuple[str, st
     return title, content_html
 
 
-def post_quality_report(date_str: str, quality_df: pd.DataFrame, output_dir: str):
+def post_quality_report(
+    date_str: str,
+    quality_df: pd.DataFrame,
+    output_dir: str,
+    quality_filename: str = "quality_with_adjustment",
+    publish: bool = True,
+):
     """Quality 리포트 저장 및 (옵션) Blogger 포스팅."""
     title, content_html = build_quality_post(date_str, quality_df)
-    quality_path = os.path.join(output_dir, f"{date_str}_quality.html")
+    quality_path = os.path.join(output_dir, f"{date_str}_{quality_filename}.html")
     with open(quality_path, "w", encoding="utf-8") as f:
         f.write(f"<!-- TITLE: {title} -->\n")
         f.write(content_html)
     print(f"Quality 리포트 HTML 저장됨: {quality_path}")
 
     post_url = None
-    if BLOGGER_AUTO_POST:
+    if BLOGGER_AUTO_POST and publish:
         post_url = post_to_blogger(title, content_html)
         if not post_url:
             raise RuntimeError("QUALITY_POST_FAILED: Blogger 포스팅 실패")
     return quality_path, post_url, title
+
+
+def run_agent_qual_signals(date_str: str, tickers: list[str]) -> pd.DataFrame:
+    """일간 Agent 신호(뉴스 기반)를 수집해 표준 스키마로 반환."""
+    if not tickers:
+        return pd.DataFrame(columns=["date", "ticker", "signal_type", "direction", "confidence", "source_url", "summary"])
+
+    pos_kw = [
+        "beats", "beat", "upgrade", "raised guidance", "partnership", "approved",
+        "record", "launch", "strong demand", "buyback", "acquisition",
+    ]
+    neg_kw = [
+        "miss", "downgrade", "cuts guidance", "probe", "lawsuit", "recall",
+        "delay", "weak demand", "fraud", "layoff", "bankruptcy",
+    ]
+
+    rows = []
+    # 비용/시간 안정성을 위해 RS/Quality 후보 중 상위 80개만 신호 수집
+    for t in tickers[:80]:
+        try:
+            news = yf.Ticker(t).get_news()
+        except Exception:
+            continue
+        if not news:
+            continue
+
+        # 최신 3건 기반으로 요약 점수
+        score = 0.0
+        count = 0
+        best_url = ""
+        best_title = ""
+        for item in news[:3]:
+            title = str(item.get("title", "") or "")
+            link = str(item.get("link", "") or "")
+            txt = title.lower()
+            local = 0.0
+            for kw in pos_kw:
+                if kw in txt:
+                    local += 1.0
+            for kw in neg_kw:
+                if kw in txt:
+                    local -= 1.0
+            if local != 0:
+                count += 1
+                score += local
+            if not best_url and link:
+                best_url = link
+            if not best_title and title:
+                best_title = title
+
+        if count == 0:
+            continue
+
+        avg = score / max(count, 1)
+        direction = 1 if avg > 0 else -1 if avg < 0 else 0
+        confidence = min(1.0, 0.4 + min(abs(avg), 2.0) * 0.3)
+        rows.append(
+            {
+                "date": date_str,
+                "ticker": t,
+                "signal_type": "news_sentiment",
+                "direction": direction,
+                "confidence": round(float(confidence), 3),
+                "source_url": best_url,
+                "summary": best_title[:220] if best_title else "headline sentiment signal",
+            }
+        )
+
+    return pd.DataFrame(rows, columns=["date", "ticker", "signal_type", "direction", "confidence", "source_url", "summary"])
+
+
+def generate_weekly_deep_context(
+    date_str: str,
+    quality_universe: pd.DataFrame,
+    sector_rank_map: dict[str, int],
+) -> pd.DataFrame:
+    """주간 Deep 컨텍스트(섹터/테마 확증) 생성."""
+    if quality_universe.empty:
+        return pd.DataFrame(columns=["week", "theme_or_sector", "thesis", "evidence", "risk", "confidence", "source_url"])
+
+    monday = (dt.datetime.strptime(date_str, "%Y-%m-%d").date() - dt.timedelta(days=dt.datetime.strptime(date_str, "%Y-%m-%d").weekday()))
+    week_str = monday.strftime("%Y-%m-%d")
+
+    sector_mean = (
+        quality_universe.groupby("Sector")
+        .agg(avg_rs=("RS_Rating", "mean"), mean_3m=("Return_3M", "mean"), n=("Ticker", "count"))
+        .reset_index()
+    )
+    sector_mean["rank"] = sector_mean["Sector"].map(sector_rank_map).fillna(len(sector_rank_map) + 1)
+    sector_mean = sector_mean.sort_values("rank")
+
+    rows = []
+    top3 = sector_mean.head(3)
+    bot3 = sector_mean.tail(3)
+    for _, r in top3.iterrows():
+        rows.append(
+            {
+                "week": week_str,
+                "theme_or_sector": r["Sector"],
+                "thesis": "섹터 리더십 유지 가능성",
+                "evidence": f"RS 평균 {r['avg_rs']:.1f}, 3M 평균수익률 {r['mean_3m'] * 100:+.2f}%",
+                "risk": "실적 시즌 변동성/밸류에이션 부담",
+                "confidence": 0.75,
+                "source_url": "https://finance.yahoo.com/",
+            }
+        )
+    for _, r in bot3.iterrows():
+        rows.append(
+            {
+                "week": week_str,
+                "theme_or_sector": r["Sector"],
+                "thesis": "섹터 약세/리스크 확대",
+                "evidence": f"RS 평균 {r['avg_rs']:.1f}, 3M 평균수익률 {r['mean_3m'] * 100:+.2f}%",
+                "risk": "숏커버링/정책 변화 시 급반등 가능",
+                "confidence": 0.72,
+                "source_url": "https://finance.yahoo.com/",
+            }
+        )
+    return pd.DataFrame(rows, columns=["week", "theme_or_sector", "thesis", "evidence", "risk", "confidence", "source_url"])
+
+
+def run_deep_research_weekly_context(date_str: str) -> pd.DataFrame:
+    """최근 주간 Deep 컨텍스트 파일 로드."""
+    data_dir = os.path.join(os.path.dirname(__file__), DATA_DIR_NAME)
+    os.makedirs(data_dir, exist_ok=True)
+    path = os.path.join(data_dir, "deep_research_weekly.json")
+    if not os.path.exists(path):
+        print("DEEP_CONTEXT_FETCH_FAILED: weekly context file not found")
+        return pd.DataFrame(columns=["week", "theme_or_sector", "thesis", "evidence", "risk", "confidence", "source_url"])
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if isinstance(payload, dict):
+            records = payload.get("records", [])
+        else:
+            records = payload
+        return pd.DataFrame(records)
+    except Exception as e:
+        print(f"DEEP_CONTEXT_FETCH_FAILED: {e}")
+        return pd.DataFrame(columns=["week", "theme_or_sector", "thesis", "evidence", "risk", "confidence", "source_url"])
+
+
+def save_weekly_deep_context(deep_df: pd.DataFrame):
+    data_dir = os.path.join(os.path.dirname(__file__), DATA_DIR_NAME)
+    os.makedirs(data_dir, exist_ok=True)
+    path = os.path.join(data_dir, "deep_research_weekly.json")
+    payload = {
+        "updated_at": dt.datetime.utcnow().isoformat() + "Z",
+        "records": deep_df.to_dict(orient="records"),
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    print(f"Deep context saved: {path}")
+    return path
+
+
+def compute_qual_adjustment(
+    quality_df: pd.DataFrame,
+    qual_signal_df: pd.DataFrame,
+    deep_theme_df: pd.DataFrame,
+    sector_map: dict[str, str],
+) -> pd.DataFrame:
+    """일간 Agent + 주간 Deep 컨텍스트를 점수 보정값으로 변환."""
+    date_str = dt.date.today().strftime("%Y-%m-%d")
+    base = pd.DataFrame({"ticker": quality_df["Ticker"].tolist()})
+    base["date"] = date_str
+    base["daily_adjust"] = 0
+    base["weekly_adjust"] = 0
+
+    # 일간 Agent 신호: confidence와 방향으로 -3 ~ +3
+    if qual_signal_df is not None and not qual_signal_df.empty:
+        sig = qual_signal_df.copy()
+        sig["ticker"] = sig["ticker"].astype(str)
+
+        def to_daily(row):
+            d = int(row.get("direction", 0))
+            c = float(row.get("confidence", 0.0))
+            if d == 0 or c < 0.30:
+                return 0
+            if c >= 0.85:
+                m = 3
+            elif c >= 0.65:
+                m = 2
+            else:
+                m = 1
+            return m if d > 0 else -m
+
+        sig["daily_score"] = sig.apply(to_daily, axis=1)
+        sig_g = sig.groupby("ticker", as_index=False)["daily_score"].sum()
+        sig_g["daily_adjust"] = sig_g["daily_score"].clip(lower=-3, upper=3)
+        base = base.merge(sig_g[["ticker", "daily_adjust"]], on="ticker", how="left", suffixes=("", "_new"))
+        base["daily_adjust"] = base["daily_adjust_new"].fillna(base["daily_adjust"]).astype(int)
+        base = base.drop(columns=["daily_adjust_new"])
+
+    # 주간 Deep 컨텍스트: 섹터/테마 매칭으로 -2 ~ +2
+    if deep_theme_df is not None and not deep_theme_df.empty:
+        local = deep_theme_df.copy()
+        local["theme_or_sector"] = local["theme_or_sector"].astype(str)
+        local["thesis"] = local["thesis"].astype(str)
+        local["confidence"] = pd.to_numeric(local.get("confidence", 0.0), errors="coerce").fillna(0.0)
+
+        sector_scores = {}
+        for _, r in local.iterrows():
+            theme = r["theme_or_sector"]
+            conf = float(r["confidence"])
+            thesis = r["thesis"].lower()
+            sign = 1
+            if any(k in thesis for k in ["약세", "리스크", "risk", "bear", "weak"]):
+                sign = -1
+            mag = 2 if conf >= 0.75 else 1 if conf >= 0.55 else 0
+            sector_scores[theme] = max(-2, min(2, sector_scores.get(theme, 0) + sign * mag))
+
+        weekly = []
+        for t in base["ticker"].tolist():
+            s = sector_map.get(t, "")
+            weekly.append(sector_scores.get(s, 0))
+        base["weekly_adjust"] = pd.Series(weekly, index=base.index).astype(int)
+
+    base["total_adjust"] = base["daily_adjust"] + base["weekly_adjust"]
+    base["total_adjust_clipped"] = base["total_adjust"].clip(lower=-5, upper=5).astype(int)
+    return base[["date", "ticker", "daily_adjust", "weekly_adjust", "total_adjust_clipped"]]
+
+
+def merge_quality_with_adjustment(
+    quality_df: pd.DataFrame,
+    qual_adjustment_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Quality 점수에 보정값을 결합해 최종 점수 생성."""
+    merged = quality_df.copy()
+    if qual_adjustment_df is None or qual_adjustment_df.empty:
+        merged["daily_adjust"] = 0
+        merged["weekly_adjust"] = 0
+        merged["total_adjust_clipped"] = 0
+    else:
+        merged = merged.merge(
+            qual_adjustment_df,
+            left_on="Ticker",
+            right_on="ticker",
+            how="left",
+        )
+        for c in ["daily_adjust", "weekly_adjust", "total_adjust_clipped"]:
+            merged[c] = merged[c].fillna(0).astype(int)
+        if "ticker" in merged.columns:
+            merged = merged.drop(columns=["ticker"])
+        if "date" in merged.columns:
+            merged = merged.drop(columns=["date"])
+
+    merged["FinalQualityScore"] = (merged["QualityScore"] + merged["total_adjust_clipped"]).clip(lower=0, upper=105)
+    merged = merged.sort_values(by=["FinalQualityScore", "RS_Rating"], ascending=[False, False]).reset_index(drop=True)
+    merged["Rank"] = range(1, len(merged) + 1)
+    return merged
 
 
 def get_sector_avg_return(df_prices, rs_df):
@@ -1404,44 +1681,24 @@ def run_universe(index_name, loader_func, output_dir=None): # output_dir 호환�
 
 
 def main():
-    # output_dir = os.path.join(os.path.dirname(__file__), "output")
-    # os.makedirs(output_dir, exist_ok=True)
+    parser = argparse.ArgumentParser(description="RS + Quality reporting pipeline")
+    parser.add_argument(
+        "--weekly-deep",
+        action="store_true",
+        help="Generate weekly deep research context only",
+    )
+    args = parser.parse_args()
+
     today = dt.date.today()
     date_str = today.strftime("%Y-%m-%d")
+    root_dir = os.path.dirname(__file__)
+    output_dir = os.path.join(root_dir, OUTPUT_DIR_NAME)
+    os.makedirs(output_dir, exist_ok=True)
 
-    # 데이터 수집 (run_universe는 이제 HTML을 저장하지 않고 데이터만 반환)
+    # 데이터 수집
     nasdaq_rs, nasdaq_prices = run_universe("NASDAQ 100", load_nasdaq100_universe)
     sp500_rs, sp500_prices = run_universe("S&P 500", load_sp500_universe)
-
-    # 통합 리포트 생성
-    print("\n통합 리포트 생성 중...")
-    combined_html = build_combined_post(
-        date_str, nasdaq_rs, sp500_rs, nasdaq_prices, sp500_prices
-    )
-    combined_title = f"{date_str} 미국 주식 시장 브리핑 & 상대강도 리포트"
-
-    # 로컬 저장 (디버깅용)
-    output_dir = os.path.join(os.path.dirname(__file__), "output")
-    os.makedirs(output_dir, exist_ok=True)
-    path = os.path.join(output_dir, f"{date_str}_combined.html")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(f"<!-- TITLE: {combined_title} -->\n")
-        f.write(combined_html)
-    print(f"통합 리포트 HTML 저장됨: {path}")
-
-    # Blogger 자동 포스팅
-    if BLOGGER_AUTO_POST:
-        print("\n===== Blogger 자동 포스팅 시작 =====")
-        post_to_blogger(combined_title, combined_html)
-    else:
-        print("\nBlogger 자동 포스팅이 비활성화되어 있습니다.")
-        print("자동 포스팅을 원하면 환경변수 BLOGGER_AUTO_POST=true 로 설정하세요.")
-
-    # --- Quality 리포트 생성/포스팅 ---
-    print("\n===== Quality 리포트 생성 시작 =====")
     quality_universe = build_quality_universe(nasdaq_rs, sp500_rs)
-    all_prices = pd.concat([nasdaq_prices, sp500_prices], axis=1)
-    all_prices = all_prices.loc[:, ~all_prices.columns.duplicated()]
 
     sector_rank_df = (
         quality_universe.groupby("Sector")
@@ -1453,14 +1710,92 @@ def main():
     sector_rank_df["순위"] = range(1, len(sector_rank_df) + 1)
     sector_rank_map = dict(zip(sector_rank_df["Sector"], sector_rank_df["순위"]))
 
+    # 주간 모드: deep context만 생성/저장
+    if args.weekly_deep:
+        print("\n===== Weekly Deep Context 생성 시작 =====")
+        deep_df = generate_weekly_deep_context(date_str, quality_universe, sector_rank_map)
+        save_weekly_deep_context(deep_df)
+        print("Weekly Deep Context 생성 완료")
+        return
+
+    # 통합 리포트 생성/포스팅
+    print("\n통합 리포트 생성 중...")
+    combined_html = build_combined_post(
+        date_str, nasdaq_rs, sp500_rs, nasdaq_prices, sp500_prices
+    )
+    combined_title = f"{date_str} 미국 주식 시장 브리핑 & 상대강도 리포트"
+    path = os.path.join(output_dir, f"{date_str}_combined.html")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"<!-- TITLE: {combined_title} -->\n")
+        f.write(combined_html)
+    print(f"통합 리포트 HTML 저장됨: {path}")
+
+    if BLOGGER_AUTO_POST:
+        print("\n===== Blogger 자동 포스팅 시작 =====")
+        post_to_blogger(combined_title, combined_html)
+    else:
+        print("\nBlogger 자동 포스팅이 비활성화되어 있습니다.")
+        print("자동 포스팅을 원하면 환경변수 BLOGGER_AUTO_POST=true 로 설정하세요.")
+
+    # Quality 기본점수 계산
+    print("\n===== Quality 리포트 생성 시작 =====")
+    all_prices = pd.concat([nasdaq_prices, sp500_prices], axis=1)
+    all_prices = all_prices.loc[:, ~all_prices.columns.duplicated()]
     quality_df = compute_quality_score(
         df_candidates=quality_universe,
         df_prices=all_prices,
         sector_rank_map=sector_rank_map,
     )
 
+    # 일간 Agent 신호
     try:
-        post_quality_report(date_str=date_str, quality_df=quality_df, output_dir=output_dir)
+        qual_signal_df = run_agent_qual_signals(date_str, quality_df["Ticker"].tolist())
+    except Exception as e:
+        print(f"AGENT_SIGNAL_FETCH_FAILED: {e}")
+        qual_signal_df = pd.DataFrame(columns=["date", "ticker", "signal_type", "direction", "confidence", "source_url", "summary"])
+    if qual_signal_df.empty:
+        print("AGENT_SIGNAL_FETCH_FAILED: no usable daily signals")
+
+    qual_signal_path = os.path.join(output_dir, f"{date_str}_qual_signals.json")
+    with open(qual_signal_path, "w", encoding="utf-8") as f:
+        json.dump(qual_signal_df.to_dict(orient="records"), f, ensure_ascii=False, indent=2)
+    print(f"Agent signals saved: {qual_signal_path}")
+
+    # 주간 Deep 컨텍스트 로드
+    deep_theme_df = run_deep_research_weekly_context(date_str)
+
+    # 보정 계산/결합
+    ticker_sector_map = dict(zip(quality_df["Ticker"], quality_df["Sector"]))
+    qual_adjustment_df = compute_qual_adjustment(
+        quality_df=quality_df,
+        qual_signal_df=qual_signal_df,
+        deep_theme_df=deep_theme_df,
+        sector_map=ticker_sector_map,
+    )
+    adjusted_quality_df = merge_quality_with_adjustment(quality_df, qual_adjustment_df)
+
+    # 기존 품질 리포트(기본 점수) 보존
+    post_quality_report(
+        date_str=date_str,
+        quality_df=quality_df.assign(
+            daily_adjust=0,
+            weekly_adjust=0,
+            total_adjust_clipped=0,
+            FinalQualityScore=quality_df["QualityScore"],
+        ),
+        output_dir=output_dir,
+        quality_filename="quality",
+        publish=False,
+    )
+
+    # 보정 반영 품질 리포트(최종)
+    try:
+        post_quality_report(
+            date_str=date_str,
+            quality_df=adjusted_quality_df,
+            output_dir=output_dir,
+            quality_filename="quality_with_adjustment",
+        )
         if BLOGGER_AUTO_POST:
             print("Quality 리포트 포스팅 완료")
     except Exception as e:

@@ -1,0 +1,44 @@
+name: Weekly Deep Research Context
+
+on:
+  schedule:
+    # 토요일 00:30 UTC
+    - cron: "30 0 * * 6"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-weekly-context:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate weekly deep context
+        run: python rs_blogger.py --weekly-deep
+
+      - name: Commit weekly context
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/deep_research_weekly.json
+          if git diff --cached --quiet; then
+            echo "No deep context changes"
+          else
+            git commit -m "Update weekly deep research context"
+            git push
+          fi
