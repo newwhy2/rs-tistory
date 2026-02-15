@@ -775,7 +775,7 @@ def build_theme_tracker() -> str:
     if not rows:
         return ""
 
-    df = pd.DataFrame(rows).sort_values("Today", ascending=False).reset_index(drop=True)
+    df = pd.DataFrame(rows).sort_values("RS", ascending=False).reset_index(drop=True)
 
     def fmt(v: float) -> str:
         if pd.isna(v):
@@ -823,22 +823,33 @@ def build_industry_rank_table(df_prices: pd.DataFrame, rs_df: pd.DataFrame) -> s
         return ""
 
     px = df_prices[sector_cols].copy()
-    returns = px.pct_change()
-    sector_ret = returns.T.groupby(pd.Series(sector_map)).mean().T.dropna(how="all")
-    if sector_ret.empty:
+    if px.empty:
+        return ""
+
+    # 종목별 가격을 시작점 1로 정규화한 뒤 섹터 평균 곡선을 만든다.
+    # 이 방식은 일부 종목 결측이 있어도 섹터 곡선을 안정적으로 계산한다.
+    norm = px.copy()
+    for col in norm.columns:
+        s = norm[col].dropna()
+        if s.empty or s.iloc[0] == 0:
+            norm[col] = float("nan")
+        else:
+            norm[col] = norm[col] / s.iloc[0]
+
+    sector_curve = norm.T.groupby(pd.Series(sector_map)).mean().T
+    sector_curve = sector_curve.ffill().dropna(how="all")
+    if sector_curve.empty:
         return ""
 
     horizons = {"1D": 1, "1W": 5, "1M": 21, "3M": 63, "6M": 126, "12M": 252}
-    rank_df = pd.DataFrame({"Sector": sector_ret.columns})
-
-    # 누적 수익률 지수화로 기간수익률 계산(빈값 방지)
-    sector_curve = (1 + sector_ret.fillna(0)).cumprod()
+    rank_df = pd.DataFrame({"Sector": sector_curve.columns})
 
     for label, bars in horizons.items():
         if len(sector_curve) <= bars:
             rank_df[label] = "-"
             continue
         period_ret = (sector_curve.iloc[-1] / sector_curve.iloc[-(bars + 1)]) - 1.0
+        period_ret = pd.to_numeric(period_ret, errors="coerce")
         rank_raw = period_ret.rank(ascending=False, method="min")
         rank_df[label] = rank_raw.apply(lambda x: int(x) if pd.notna(x) else "-")
 
@@ -863,6 +874,13 @@ def build_industry_rank_table(df_prices: pd.DataFrame, rs_df: pd.DataFrame) -> s
         by="1D",
         key=lambda s: pd.to_numeric(s, errors="coerce").fillna(9999),
     )
+
+    # 모든 기간 컬럼이 비정상이면 섹션 자체를 숨긴다.
+    rank_cols = ["1D", "1W", "1M", "3M", "6M", "12M"]
+    valid_count = pd.to_numeric(rank_df[rank_cols].stack(), errors="coerce").notna().sum()
+    if int(valid_count) == 0:
+        return ""
+
     table = rank_df[["Sector", "1D", "1W", "1M", "3M", "6M", "12M", "Rank Change"]].to_html(
         index=False, escape=False, border=1, justify="center"
     )
