@@ -124,6 +124,62 @@ def download_price_data(tickers, lookback_days):
     return df
 
 
+def detect_setup(df_prices: pd.DataFrame, ticker: str) -> str:
+    """가격 데이터로 기술적 셋업 상태를 감지한다.
+
+    감지 패턴:
+    - VCP: 최근 4주간 주간 변동폭(고가-저가 비율)이 점점 줄어듦
+    - 타이트: 최근 5일 고저 범위 < 5%
+    - 돌파: 오늘 종가 > 최근 20일 최고가
+    - 52주高: 현재가가 52주 고가의 95% 이상
+    """
+    col = df_prices[ticker].dropna()
+    if len(col) < 30:
+        return ""
+
+    latest_price = col.iloc[-1]
+    setups = []
+
+    # --- 52주 신고가 부근 ---
+    high_52w = col.tail(252).max()
+    if latest_price >= high_52w * 0.95:
+        setups.append("52주高")
+
+    # --- 돌파: 종가 > 최근 20일 최고가 (어제까지의 고가 기준) ---
+    prev_20d_high = col.iloc[-21:-1].max() if len(col) > 21 else col.iloc[:-1].max()
+    if latest_price > prev_20d_high:
+        setups.append("돌파")
+
+    # --- 타이트 (최근 5일 고저 범위 < 5%) ---
+    recent_5d = col.tail(5)
+    range_pct = (recent_5d.max() - recent_5d.min()) / (recent_5d.min() + 1e-9)
+    if range_pct < 0.05:
+        setups.append("타이트")
+
+    # --- VCP (Volatility Contraction Pattern) ---
+    # 최근 4주의 주간 변동폭이 점점 줄어들면 VCP
+    if len(col) >= 20:
+        weekly_ranges = []
+        for i in range(4):
+            start = -(i + 1) * 5
+            end = -i * 5 if i > 0 else None
+            week_data = col.iloc[start:end] if end else col.iloc[start:]
+            if len(week_data) > 0:
+                w_range = (week_data.max() - week_data.min()) / (week_data.min() + 1e-9)
+                weekly_ranges.append(w_range)
+        weekly_ranges.reverse()  # 오래된 주 → 최근 주 순서
+
+        if len(weekly_ranges) >= 3:
+            contractions = sum(
+                1 for i in range(1, len(weekly_ranges))
+                if weekly_ranges[i] < weekly_ranges[i - 1]
+            )
+            if contractions >= 2:
+                setups.append("VCP")
+
+    return ",".join(setups) if setups else "-"
+
+
 def compute_rs_ibd_style(df_prices: pd.DataFrame) -> pd.DataFrame:
     """IBD 스타일(가중치)로 RS 점수 계산.
 
@@ -259,6 +315,27 @@ def compute_rs_ibd_style(df_prices: pd.DataFrame) -> pd.DataFrame:
     rs_3m[ipo_mask] = 1
     rs_12m[ipo_mask] = 1
 
+    # --- D-1 RS 계산 (전일 대비 변동용) ---
+    if len(df_prices) >= 254:
+        df_prev = df_prices.iloc[:-1]  # 어제까지의 데이터
+        prev_latest = df_prev.iloc[-1]
+        prev_c63 = df_prev.iloc[-min(63, len(df_prev))]
+        prev_c126 = df_prev.iloc[-min(126, len(df_prev))]
+        prev_c189 = df_prev.iloc[-min(189, len(df_prev))]
+        prev_c252 = df_prev.iloc[-min(252, len(df_prev))]
+
+        prev_ratio_q1 = prev_latest / (prev_c63 + eps)
+        prev_ratio_q2 = prev_latest / (prev_c126 + eps)
+        prev_ratio_q3 = prev_latest / (prev_c189 + eps)
+        prev_ratio_q4 = prev_latest / (prev_c252 + eps)
+        prev_rs_raw = 2 * prev_ratio_q1 + prev_ratio_q2 + prev_ratio_q3 + prev_ratio_q4
+        rs_prev = (prev_rs_raw.rank(pct=True) * 98 + 1).round(0)
+        rs_prev[ipo_mask] = 1
+    else:
+        rs_prev = rs_rating.copy()  # 데이터 부족 시 변동 없음
+
+    rs_change = rs_rating - rs_prev
+
     tickers = list(df_prices.columns)
     meta_map = get_company_meta(tickers)
 
@@ -269,6 +346,7 @@ def compute_rs_ibd_style(df_prices: pd.DataFrame) -> pd.DataFrame:
             "Sector": [meta_map.get(t, {}).get("sector", "Unknown") for t in tickers],
             "RS_Raw": rs_raw.values,
             "RS_Rating": rs_rating.values,
+            "RS_Change": rs_change.values,
             "Return_1M": ret_1m.values,
             "Return_3M": ret_3m.values,
             "Return_12M": ret_12m.values,
@@ -289,7 +367,7 @@ def format_percent(x):
     return f"{x * 100:.2f}%"
 
 
-def build_post_content(date_str, index_name, rs_df):
+def build_post_content(date_str, index_name, rs_df, df_prices=None):
     """블로그(구글 Blogger)에 붙여넣을 한국어 HTML 본문 생성."""
     top_df = rs_df.head(TOP_N).copy()
 
@@ -307,7 +385,7 @@ def build_post_content(date_str, index_name, rs_df):
     top_df["티커"] = top_df["Ticker"]
     top_df["회사명"] = top_df["Name"]
     top_df["섹터"] = top_df["Sector"].apply(
-        lambda s: f"{s}({sector_rank_map.get(s, '?')}순위섹터)"
+        lambda s: f"{s}({sector_rank_map.get(s, '?')}위섹터)"
     )
     top_df["1개월 수익률"] = top_df["Return_1M"].apply(format_percent)
     top_df["3개월 수익률"] = top_df["Return_3M"].apply(format_percent)
@@ -315,13 +393,29 @@ def build_post_content(date_str, index_name, rs_df):
     top_df["1개월 RS"] = top_df["RS_1M"].astype(int)
     top_df["3개월 RS"] = top_df["RS_3M"].astype(int)
     top_df["12개월 RS"] = top_df["RS_12M"].astype(int)
-    top_df["RS 등급(1~99)"] = top_df["RS_Rating"].astype(int)
+    top_df["RS 등급"] = top_df["RS_Rating"].astype(int)
+
+    # RS 변동 (전일 대비)
+    def format_rs_change(val):
+        v = int(val)
+        if v > 0:
+            return f"<span style='color:red'>+{v}</span>"
+        elif v < 0:
+            return f"<span style='color:blue'>{v}</span>"
+        return "0"
+    top_df["RS변동"] = top_df["RS_Change"].apply(format_rs_change)
+
+    # 기술적 셋업 감지
+    if df_prices is not None:
+        top_df["셋업"] = top_df["Ticker"].apply(lambda t: detect_setup(df_prices, t))
+    else:
+        top_df["셋업"] = "-"
 
     display_df = top_df[[
         "티커", "회사명", "섹터",
+        "RS 등급", "RS변동", "셋업",
         "1개월 수익률", "3개월 수익률", "12개월 수익률",
         "1개월 RS", "3개월 RS", "12개월 RS",
-        "RS 등급(1~99)",
     ]]
 
     table_html = display_df.to_html(
@@ -344,7 +438,7 @@ def build_post_content(date_str, index_name, rs_df):
     sector_summary = sector_summary.sort_values("섹터평균_RS", ascending=False).reset_index(drop=True)
     # 섹터명에 순위 표시
     sector_summary["섹터"] = sector_summary.apply(
-        lambda row: f"{row['Sector']}({sector_rank_map.get(row['Sector'], '?')}순위섹터)",
+        lambda row: f"{row['Sector']}({sector_rank_map.get(row['Sector'], '?')}위섹터)",
         axis=1,
     )
     sector_display = sector_summary[["섹터", "섹터평균_RS", "종목수"]]
@@ -355,20 +449,21 @@ def build_post_content(date_str, index_name, rs_df):
         justify="center",
     )
 
+    # CSS: 테이블 스타일 (티커 줄바꿈 방지, 모바일 스크롤)
+    style_html = """
+<style>
+.rs-table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.rs-table-wrap table { border-collapse: collapse; width: 100%; font-size: 14px; }
+.rs-table-wrap th, .rs-table-wrap td { padding: 6px 8px; white-space: nowrap; }
+.rs-table-wrap th { background: #f0f0f0; }
+</style>
+"""
+
     intro_html = f"""
 <p><strong>{date_str} {index_name} 상대강도 리포트</strong></p>
-<p>본 포스트는 최근 약 1년(최대 252 거래일) 동안의 주가 흐름을 바탕으로,
-Investor's Business Daily(IBD) 스타일의 상대강도(Relative Strength, RS) 점수를
-참고하여 계산한 결과입니다.</p>
-<p>RS 계산식은 대략적으로 다음과 같은 가중치를 사용합니다.<br/>
-RS ≈ 2 × (현재가 / 63거래일 전 종가) + (현재가 / 126거래일 전 종가)
-+ (현재가 / 189거래일 전 종가) + (현재가 / 252거래일 전 종가)</p>
-<p>신규상장(IPO) 종목의 경우, 거래일 5일 미만은 RS=1로 고정하고,
-데이터가 부족한 기간은 가용 데이터를 기반으로 외삽하여 계산합니다.</p>
-<p>이 값을 기준으로 전체 종목을 백분위 순위로 정렬해 1~99 등급 형태의
-RS 등급을 만든 뒤, 상위 {TOP_N}개 종목을 추려서 정리했습니다.</p>
-<p>아래 첫 번째 표는 상위 종목 리스트이고, 두 번째 표는 전체 종목 기준으로
-섹터별 평균 RS 등급과 종목 수를 정리한 것입니다.</p>
+<p>RS 계산식 (IBD 스타일 가중치):<br/>
+RS ≈ 2 × (현재가/63일전) + (현재가/126일전) + (현재가/189일전) + (현재가/252일전)</p>
+<p>셋업 범례: <b>VCP</b>=변동성 수축, <b>타이트</b>=5일 범위&lt;5%, <b>돌파</b>=20일 고가 돌파, <b>52주高</b>=52주 고가 부근</p>
 """
 
     disclaimer_html = """
@@ -376,7 +471,10 @@ RS 등급을 만든 뒤, 상위 {TOP_N}개 종목을 추려서 정리했습니�
 투자 판단의 최종 책임은 투자자 본인에게 있습니다.</em></p>
 """
 
-    content_html = intro_html + table_html + "<br/><br/>" + sector_table_html + disclaimer_html
+    wrapped_table = f'<div class="rs-table-wrap">{table_html}</div>'
+    wrapped_sector = f'<div class="rs-table-wrap">{sector_table_html}</div>'
+
+    content_html = style_html + intro_html + wrapped_table + "<br/><br/>" + wrapped_sector + disclaimer_html
     return content_html
 
 
@@ -473,6 +571,7 @@ def run_universe(index_name, loader_func, output_dir):
         date_str=date_str,
         index_name=index_name,
         rs_df=rs_df,
+        df_prices=df_prices,
     )
 
     title = f"{date_str} {index_name} 상대강도 TOP {TOP_N}"
