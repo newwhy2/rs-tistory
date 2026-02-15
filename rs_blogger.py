@@ -21,6 +21,7 @@ BLOGGER_BLOG_ID = os.getenv("BLOGGER_BLOG_ID", "")
 # 252 거래일(약 1년)까지 써야 해서 넉넉하게 260일로 설정
 LOOKBACK_DAYS = 260
 TOP_N = 30
+QUALITY_TOP_N = 30
 
 THEME_ETF_MAP = {
     "Semiconductors": "SMH",
@@ -818,6 +819,392 @@ def build_industry_rank_table(df_prices: pd.DataFrame, rs_df: pd.DataFrame) -> s
     )
 
 
+def _band_score(value: float, thresholds: list[tuple[float, int]]) -> int:
+    if pd.isna(value):
+        return 0
+    for th, score in thresholds:
+        if value >= th:
+            return score
+    return 0
+
+
+def _safe_debt_ratio(value: float) -> float:
+    if pd.isna(value):
+        return float("nan")
+    # yfinance debtToEquity가 120(%) 형식으로 오는 경우를 비율(1.2)로 정규화
+    return value / 100.0 if value > 10 else value
+
+
+def _extract_revenue_cagr_3y(ticker_obj) -> float:
+    frames = []
+    for attr in ["income_stmt", "financials"]:
+        try:
+            df = getattr(ticker_obj, attr, None)
+            if callable(df):
+                df = df()
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                frames.append(df)
+        except Exception:
+            continue
+    for method in ["get_income_stmt", "get_financials"]:
+        try:
+            fn = getattr(ticker_obj, method, None)
+            if callable(fn):
+                df = fn()
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    frames.append(df)
+        except Exception:
+            continue
+
+    for frame in frames:
+        row_key = None
+        for idx in frame.index.astype(str):
+            if "total revenue" in idx.lower().replace("_", " "):
+                row_key = idx
+                break
+        if row_key is None:
+            continue
+
+        rev = pd.to_numeric(frame.loc[row_key], errors="coerce").dropna()
+        if len(rev) < 4:
+            continue
+        rev = rev.sort_index()
+        base = float(rev.iloc[-4])
+        latest = float(rev.iloc[-1])
+        if base <= 0 or latest <= 0:
+            return float("nan")
+        return (latest / base) ** (1.0 / 3.0) - 1.0
+    return float("nan")
+
+
+def build_quality_universe(nasdaq_rs: pd.DataFrame, sp500_rs: pd.DataFrame) -> pd.DataFrame:
+    """NASDAQ100 + S&P500 결합 후 중복 티커 제거."""
+    merged = pd.concat([nasdaq_rs, sp500_rs], ignore_index=True)
+    merged = merged.sort_values("RS_Rating", ascending=False)
+    merged = merged.drop_duplicates(subset=["Ticker"], keep="first").reset_index(drop=True)
+    return merged
+
+
+def fetch_quality_fundamentals(tickers: list[str]) -> pd.DataFrame:
+    """Quality 스코어링용 펀더멘털/유동성 데이터 수집."""
+    rows = []
+    for t in tickers:
+        revenue_growth = float("nan")
+        earnings_growth = float("nan")
+        roe = float("nan")
+        operating_margins = float("nan")
+        debt_to_equity = float("nan")
+        market_cap = float("nan")
+        avg_vol_10d = float("nan")
+        revenue_cagr_3y = float("nan")
+        current_price = float("nan")
+
+        try:
+            tk = yf.Ticker(t)
+            info = tk.get_info() or {}
+            revenue_growth = info.get("revenueGrowth", float("nan"))
+            earnings_growth = info.get("earningsGrowth", float("nan"))
+            roe = info.get("returnOnEquity", float("nan"))
+            operating_margins = info.get("operatingMargins", float("nan"))
+            debt_to_equity = _safe_debt_ratio(info.get("debtToEquity", float("nan")))
+            market_cap = info.get("marketCap", float("nan"))
+            avg_vol_10d = info.get("averageDailyVolume10Day", float("nan"))
+            current_price = (
+                info.get("regularMarketPrice")
+                or info.get("currentPrice")
+                or float("nan")
+            )
+            revenue_cagr_3y = _extract_revenue_cagr_3y(tk)
+        except Exception:
+            pass
+
+        rows.append(
+            {
+                "Ticker": t,
+                "RevenueGrowth": revenue_growth,
+                "EarningsGrowth": earnings_growth,
+                "RevenueCagr3Y": revenue_cagr_3y,
+                "ReturnOnEquity": roe,
+                "OperatingMargins": operating_margins,
+                "DebtToEquity": debt_to_equity,
+                "MarketCap": market_cap,
+                "AvgDailyVolume10Day": avg_vol_10d,
+                "CurrentPrice": current_price,
+            }
+        )
+
+    df = pd.DataFrame(rows)
+
+    # 최근 20일 평균 거래대금(달러) 추정: 20일 평균 거래량 * 최근 종가
+    try:
+        vol_raw = yf.download(tickers, period="3mo", auto_adjust=False, progress=False)
+        if isinstance(vol_raw.columns, pd.MultiIndex):
+            close_df = (
+                vol_raw.xs("Close", axis=1, level=0)
+                if "Close" in vol_raw.columns.get_level_values(0)
+                else pd.DataFrame()
+            )
+            volume_df = (
+                vol_raw.xs("Volume", axis=1, level=0)
+                if "Volume" in vol_raw.columns.get_level_values(0)
+                else pd.DataFrame()
+            )
+        else:
+            close_df = vol_raw["Close"].to_frame() if "Close" in vol_raw.columns else pd.DataFrame()
+            volume_df = vol_raw["Volume"].to_frame() if "Volume" in vol_raw.columns else pd.DataFrame()
+
+        if not close_df.empty and not volume_df.empty:
+            dollar_vol = close_df * volume_df
+            dv20 = dollar_vol.rolling(20).mean().iloc[-1]
+            if isinstance(dv20, pd.Series):
+                df["DollarVol20"] = df["Ticker"].map(dv20.to_dict())
+            else:
+                only_ticker = tickers[0] if tickers else None
+                df["DollarVol20"] = dv20 if only_ticker else float("nan")
+        else:
+            df["DollarVol20"] = float("nan")
+    except Exception:
+        df["DollarVol20"] = float("nan")
+
+    # volume만 있고 dollar volume이 비면 currentPrice로 대체 계산
+    fallback_dollar = df["AvgDailyVolume10Day"] * df["CurrentPrice"]
+    df["DollarVol20"] = df["DollarVol20"].fillna(fallback_dollar)
+    return df
+
+
+def compute_quality_score(
+    df_candidates: pd.DataFrame,
+    df_prices: pd.DataFrame,
+    sector_rank_map: dict[str, int],
+) -> pd.DataFrame:
+    """정성(quality) 스코어를 계산하고 랭킹 테이블을 반환."""
+    quality = df_candidates.copy()
+    fundamentals = fetch_quality_fundamentals(quality["Ticker"].tolist())
+    quality = quality.merge(fundamentals, on="Ticker", how="left")
+
+    sector_count = max(len(sector_rank_map), 1)
+    top_cut = max(1, int(sector_count * 0.3 + 0.999))
+    mid_cut = max(top_cut + 1, int(sector_count * 0.7 + 0.999))
+
+    liq_threshold = quality["DollarVol20"].dropna().quantile(0.4)
+
+    growth_scores = []
+    profitability_scores = []
+    leadership_scores = []
+    chart_scores = []
+    liquidity_scores = []
+    setup_texts = []
+    confidence_tags = []
+
+    required_cols = [
+        "RevenueGrowth",
+        "EarningsGrowth",
+        "RevenueCagr3Y",
+        "ReturnOnEquity",
+        "OperatingMargins",
+        "DebtToEquity",
+        "MarketCap",
+        "AvgDailyVolume10Day",
+        "DollarVol20",
+    ]
+
+    for _, row in quality.iterrows():
+        # 1) 성장 품질 (35)
+        score_growth = 0
+        score_growth += _band_score(row.get("RevenueGrowth"), [(0.15, 12), (0.05, 8), (0.0, 4)])
+        score_growth += _band_score(row.get("EarningsGrowth"), [(0.20, 12), (0.05, 8), (0.0, 4)])
+        score_growth += _band_score(row.get("RevenueCagr3Y"), [(0.12, 11), (0.05, 7), (0.0, 3)])
+
+        # 2) 수익성/재무 (25)
+        score_profit = 0
+        score_profit += _band_score(row.get("ReturnOnEquity"), [(0.17, 10), (0.10, 7), (0.05, 4)])
+        score_profit += _band_score(row.get("OperatingMargins"), [(0.15, 8), (0.08, 5), (0.03, 2)])
+        debt = row.get("DebtToEquity")
+        if pd.notna(debt):
+            if debt < 0.7:
+                score_profit += 7
+            elif debt <= 1.5:
+                score_profit += 4
+
+        # 3) 수급/리더십 (20)
+        score_lead = 0
+        rs_rating = row.get("RS_Rating")
+        rs_change = row.get("RS_Change")
+        if pd.notna(rs_rating):
+            if rs_rating >= 90:
+                score_lead += 10
+            elif rs_rating >= 80:
+                score_lead += 7
+            elif rs_rating >= 70:
+                score_lead += 4
+        if pd.notna(rs_change):
+            if rs_change > 0:
+                score_lead += 4
+            elif rs_change == 0:
+                score_lead += 2
+        s_rank = sector_rank_map.get(row.get("Sector"), sector_count)
+        if s_rank <= top_cut:
+            score_lead += 6
+        elif s_rank <= mid_cut:
+            score_lead += 3
+
+        # 4) 차트 품질 (15)
+        setup = "-"
+        if row["Ticker"] in df_prices.columns:
+            setup = detect_setup(df_prices, row["Ticker"])
+        setup_texts.append(setup)
+        score_chart = 0
+        if setup and setup != "-":
+            parts = [p.strip() for p in str(setup).split(",") if p.strip()]
+            if "VCP" in parts:
+                score_chart += 6
+            if "돌파" in parts:
+                score_chart += 5
+            if "타이트" in parts:
+                score_chart += 2
+            if "52주高" in parts:
+                score_chart += 2
+        score_chart = min(score_chart, 15)
+
+        # 5) 규모/유동성 (5)
+        score_liq = 0
+        market_cap = row.get("MarketCap")
+        if pd.notna(market_cap):
+            if market_cap > 10_000_000_000:
+                score_liq += 3
+            elif market_cap >= 3_000_000_000:
+                score_liq += 2
+        dv20 = row.get("DollarVol20")
+        if pd.notna(liq_threshold) and pd.notna(dv20) and dv20 >= liq_threshold:
+            score_liq += 2
+
+        # 결측 신뢰도
+        missing_ratio = float(pd.isna(row[required_cols]).sum()) / float(len(required_cols))
+        confidence_tags.append("Low" if missing_ratio >= 0.5 else "High")
+
+        growth_scores.append(score_growth)
+        profitability_scores.append(score_profit)
+        leadership_scores.append(score_lead)
+        chart_scores.append(score_chart)
+        liquidity_scores.append(score_liq)
+
+    quality["Setup"] = setup_texts
+    quality["ScoreGrowth"] = growth_scores
+    quality["ScoreProfitability"] = profitability_scores
+    quality["ScoreLeadership"] = leadership_scores
+    quality["ScoreChart"] = chart_scores
+    quality["ScoreLiquidity"] = liquidity_scores
+    quality["DataConfidence"] = confidence_tags
+    quality["QualityScore"] = (
+        quality["ScoreGrowth"]
+        + quality["ScoreProfitability"]
+        + quality["ScoreLeadership"]
+        + quality["ScoreChart"]
+        + quality["ScoreLiquidity"]
+    ).clip(upper=100)
+
+    quality = quality.sort_values(
+        by=["QualityScore", "RS_Rating"],
+        ascending=[False, False],
+    ).reset_index(drop=True)
+    quality["Rank"] = range(1, len(quality) + 1)
+    return quality
+
+
+def build_quality_post(date_str: str, quality_df: pd.DataFrame) -> tuple[str, str]:
+    """Quality 리더십 포스트의 제목/본문 HTML 생성."""
+    title = f"{date_str} 미국 주식 Quality 리더십 리포트 (S&P500+NASDAQ100)"
+    top_df = quality_df.head(QUALITY_TOP_N).copy()
+
+    if top_df.empty:
+        body = "<p>오늘 생성 가능한 Quality 데이터가 없습니다.</p>"
+        return title, body
+
+    top_df["순위"] = top_df["Rank"].astype(int)
+    top_df["티커"] = top_df["Ticker"]
+    top_df["회사명"] = top_df["Name"]
+    top_df["섹터"] = top_df["Sector"]
+    top_df["Quality점수"] = top_df["QualityScore"].astype(int)
+    top_df["성장점수"] = top_df["ScoreGrowth"].astype(int)
+    top_df["재무점수"] = top_df["ScoreProfitability"].astype(int)
+    top_df["수급점수"] = top_df["ScoreLeadership"].astype(int)
+    top_df["차트점수"] = top_df["ScoreChart"].astype(int)
+    top_df["유동성점수"] = top_df["ScoreLiquidity"].astype(int)
+    top_df["RS등급"] = top_df["RS_Rating"].fillna(0).astype(int)
+    top_df["셋업"] = top_df["Setup"].fillna("-")
+    top_df["DataConfidence"] = top_df["DataConfidence"].fillna("Low")
+
+    display_df = top_df[
+        [
+            "순위", "티커", "회사명", "섹터",
+            "Quality점수", "성장점수", "재무점수", "수급점수", "차트점수", "유동성점수",
+            "RS등급", "셋업", "DataConfidence",
+        ]
+    ]
+    table_html = display_df.to_html(index=False, escape=False, border=1, justify="center")
+
+    style_html = """
+<style>
+.rs-table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.rs-table-wrap table { border-collapse: collapse; width: 100%; font-size: 13px; }
+.rs-table-wrap th, .rs-table-wrap td { padding: 5px 8px; white-space: nowrap; border: 1px solid #ddd; }
+.rs-table-wrap th { background: #f5f5f5; font-weight: bold; }
+</style>
+"""
+    intro_html = f"""
+<p><strong>{date_str} QUALITY LEADERSHIP BRIEF</strong></p>
+<p>정량 RS 지표와 함께, 정성(quality) 우선순위 지표를 점수화해 상위 종목을 정리한 별도 리포트입니다.</p>
+<p>대상 유니버스: S&P 500 + NASDAQ 100 (중복 제거), 노출: Top {QUALITY_TOP_N}</p>
+"""
+    formula_html = """
+<div style="margin:10px 0;padding:15px;border:1px solid #e0e0e0;border-radius:10px;background-color:#fafafa;">
+  <h3 style="margin:0 0 10px 0;color:#333;">Quality 점수 산식 (총 100점, 완전 공개)</h3>
+  <ol style="margin:0;padding-left:18px;line-height:1.7;">
+    <li><strong>이익/매출 성장 품질 (35점)</strong>: 매출성장(12) + EPS성장(12) + 3년 매출CAGR(11)</li>
+    <li><strong>수익성/재무 건전성 (25점)</strong>: ROE(10) + 영업이익률(8) + 부채비율(7)</li>
+    <li><strong>수급/리더십/RS (20점)</strong>: RS등급(10) + RS변화(4) + 섹터랭크(6)</li>
+    <li><strong>차트 구조 품질 (15점)</strong>: VCP(+6), 돌파(+5), 타이트(+2), 52주高(+2), 최대 15</li>
+    <li><strong>규모/유동성 (5점)</strong>: 시총(3) + 최근20일 거래대금 상위60%(2)</li>
+  </ol>
+  <p style="font-size:12px;color:#666;margin:10px 0 0 0;">
+    결측치 정책: 해당 지표는 0점 처리. 필수 지표 결측 비율 50% 이상이면 DataConfidence=Low.
+  </p>
+</div>
+"""
+    disclaimer_html = """
+<p style="font-size:12px;color:#888;margin-top:20px;">
+<em>※ 본 글은 특정 종목의 매수/매도 추천이 아니며, 정보 제공만을 목적으로 합니다. 투자 판단의 책임은 투자자에게 있습니다.</em>
+</p>
+"""
+
+    content_html = (
+        style_html
+        + intro_html
+        + formula_html
+        + f'<h3>Quality Top {QUALITY_TOP_N}</h3>'
+        + f'<div class="rs-table-wrap">{table_html}</div>'
+        + disclaimer_html
+    )
+    return title, content_html
+
+
+def post_quality_report(date_str: str, quality_df: pd.DataFrame, output_dir: str):
+    """Quality 리포트 저장 및 (옵션) Blogger 포스팅."""
+    title, content_html = build_quality_post(date_str, quality_df)
+    quality_path = os.path.join(output_dir, f"{date_str}_quality.html")
+    with open(quality_path, "w", encoding="utf-8") as f:
+        f.write(f"<!-- TITLE: {title} -->\n")
+        f.write(content_html)
+    print(f"Quality 리포트 HTML 저장됨: {quality_path}")
+
+    post_url = None
+    if BLOGGER_AUTO_POST:
+        post_url = post_to_blogger(title, content_html)
+        if not post_url:
+            raise RuntimeError("QUALITY_POST_FAILED: Blogger 포스팅 실패")
+    return quality_path, post_url, title
+
+
 def get_sector_avg_return(df_prices, rs_df):
     """섹터별 당일 평균 수익률 계산."""
     latest = df_prices.iloc[-1]
@@ -1049,6 +1436,36 @@ def main():
     else:
         print("\nBlogger 자동 포스팅이 비활성화되어 있습니다.")
         print("자동 포스팅을 원하면 환경변수 BLOGGER_AUTO_POST=true 로 설정하세요.")
+
+    # --- Quality 리포트 생성/포스팅 ---
+    print("\n===== Quality 리포트 생성 시작 =====")
+    quality_universe = build_quality_universe(nasdaq_rs, sp500_rs)
+    all_prices = pd.concat([nasdaq_prices, sp500_prices], axis=1)
+    all_prices = all_prices.loc[:, ~all_prices.columns.duplicated()]
+
+    sector_rank_df = (
+        quality_universe.groupby("Sector")
+        .agg(섹터평균_RS=("RS_Rating", "mean"))
+        .reset_index()
+        .sort_values("섹터평균_RS", ascending=False)
+        .reset_index(drop=True)
+    )
+    sector_rank_df["순위"] = range(1, len(sector_rank_df) + 1)
+    sector_rank_map = dict(zip(sector_rank_df["Sector"], sector_rank_df["순위"]))
+
+    quality_df = compute_quality_score(
+        df_candidates=quality_universe,
+        df_prices=all_prices,
+        sector_rank_map=sector_rank_map,
+    )
+
+    try:
+        post_quality_report(date_str=date_str, quality_df=quality_df, output_dir=output_dir)
+        if BLOGGER_AUTO_POST:
+            print("Quality 리포트 포스팅 완료")
+    except Exception as e:
+        print(f"QUALITY_POST_FAILED: {e}")
+        raise
 
 
 if __name__ == "__main__":
