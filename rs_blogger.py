@@ -22,6 +22,24 @@ BLOGGER_BLOG_ID = os.getenv("BLOGGER_BLOG_ID", "")
 LOOKBACK_DAYS = 260
 TOP_N = 30
 
+THEME_ETF_MAP = {
+    "Semiconductors": "SMH",
+    "Software": "IGV",
+    "Cybersecurity": "HACK",
+    "Biotechnology": "XBI",
+    "Gold Miners": "GDX",
+    "Silver Miners": "SIL",
+    "Oil & Gas": "XLE",
+    "Utilities": "XLU",
+    "Industrials": "XLI",
+    "Aerospace & Defense": "ITA",
+    "Home Construction": "XHB",
+    "Retail": "XRT",
+    "Banks": "KRE",
+    "Real Estate": "XLRE",
+    "Transportation": "IYT",
+}
+
 
 def yahoo_ticker_from_wiki(ticker: str) -> str:
     """
@@ -549,55 +567,82 @@ def post_to_blogger(title, content_html):
 
 
 def build_market_breadth(df_prices: pd.DataFrame, index_name: str) -> str:
-    """시장 브리핑용 데이터 생성 (등락, 신고가 등)."""
+    """시장 브리핑용 데이터 생성 (등락, 신고가/신저가, MA 확산, 점수 기반 판정)."""
     if len(df_prices) < 252:
         return ""
 
     latest = df_prices.iloc[-1]
     prev = df_prices.iloc[-2]
-    
-    # 1. 등락 (Advance/Decline)
+
     changes = latest - prev
-    adv = (changes > 0).sum()
-    dec = (changes < 0).sum()
-    unch = (changes == 0).sum()
-    total = adv + dec + unch
-    
+    adv = int((changes > 0).sum())
+    dec = int((changes < 0).sum())
+    unch = int((changes == 0).sum())
+    total = max(adv + dec + unch, 1)
+
     adv_pct = adv / total * 100
     dec_pct = dec / total * 100
-    
-    # 2. 52주 신고가/신저가
-    # 최근 252일 고가/저가 확인
+
     high_52w = df_prices.tail(252).max()
     low_52w = df_prices.tail(252).min()
-    
-    # 오늘 고가/저가가 52주 고가/저가 경신 여부 (종가 기준 근접도 체크)
-    # 엄밀히는 장중 고가를 봐야하나 데이터가 종가뿐이므로 종가 기준으로 '신고가 영역' 판단
-    # 52주 고가의 99% 이상이면 신고가 영역으로 간주
-    new_highs = (latest >= high_52w * 0.99).sum()
-    new_lows = (latest <= low_52w * 1.01).sum()
+    new_highs = int((latest >= high_52w * 0.99).sum())
+    new_lows = int((latest <= low_52w * 1.01).sum())
 
-    # 3. 시장 심리 (Sentiment) - 단순 등락 비율 기반
-    if adv > dec * 1.2:
-        sentiment = "강세장 (Bullish) 🔥"
+    ma50 = df_prices.rolling(50).mean().iloc[-1]
+    ma200 = df_prices.rolling(200).mean().iloc[-1]
+    pct_above_50 = ((latest > ma50).sum() / total) * 100
+    pct_above_200 = ((latest > ma200).sum() / total) * 100
+
+    score = 0
+    adv_dec_ratio = adv / max(dec, 1)
+    nh_nl_ratio = new_highs / max(new_lows, 1)
+
+    if adv_dec_ratio >= 1.3:
+        score += 2
+    elif adv_dec_ratio >= 1.1:
+        score += 1
+    elif adv_dec_ratio <= 0.77:
+        score -= 2
+    elif adv_dec_ratio <= 0.91:
+        score -= 1
+
+    if nh_nl_ratio >= 1.5:
+        score += 2
+    elif nh_nl_ratio >= 1.1:
+        score += 1
+    elif nh_nl_ratio <= 0.67:
+        score -= 2
+    elif nh_nl_ratio <= 0.91:
+        score -= 1
+
+    if pct_above_50 >= 60:
+        score += 1
+    elif pct_above_50 <= 40:
+        score -= 1
+
+    if pct_above_200 >= 55:
+        score += 1
+    elif pct_above_200 <= 45:
+        score -= 1
+
+    if score >= 4:
+        sentiment = "강세 우위 (Bullish Bias)"
         sentiment_color = "#d32f2f"
-    elif dec > adv * 1.2:
-        sentiment = "약세장 (Bearish) ❄️"
+    elif score <= -4:
+        sentiment = "약세 우위 (Bearish Bias)"
         sentiment_color = "#1976d2"
     else:
-        sentiment = "관망세 (Neutral) ⚖️"
+        sentiment = "중립/혼조 (Neutral)"
         sentiment_color = "#757575"
 
-    # HTML 생성
     html = f"""
 <div style="margin:10px 0;padding:15px;border:1px solid #e0e0e0;border-radius:10px;background-color:#f9f9f9;">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-        <h3 style="margin:0;color:#333;">📊 {index_name} Market Breadth</h3>
+        <h3 style="margin:0;color:#333;">{index_name} Market Breadth</h3>
         <span style="font-size:13px;font-weight:bold;color:{sentiment_color};border:1px solid {sentiment_color};padding:2px 8px;border-radius:12px;">{sentiment}</span>
     </div>
-    
-    <!-- 등락 비율 -->
-    <div style="margin-bottom:15px;">
+
+    <div style="margin-bottom:12px;">
         <div style="display:flex;justify-content:space-between;font-size:13px;color:#555;margin-bottom:4px;">
             <span>상승 {adv} ({adv_pct:.1f}%)</span>
             <span>하락 {dec} ({dec_pct:.1f}%)</span>
@@ -608,20 +653,169 @@ def build_market_breadth(df_prices: pd.DataFrame, index_name: str) -> str:
         </div>
     </div>
 
-    <!-- 신고가/신저가 -->
     <div style="display:flex;justify-content:space-around;text-align:center;font-size:14px;">
         <div>
-            <span style="display:block;color:#999;font-size:11px;">52주 신고가 (Highs)</span>
+            <span style="display:block;color:#999;font-size:11px;">52주 신고가</span>
             <span style="font-weight:bold;color:#ff5252;">{new_highs}</span>
         </div>
         <div>
-            <span style="display:block;color:#999;font-size:11px;">52주 신저가 (Lows)</span>
+            <span style="display:block;color:#999;font-size:11px;">52주 신저가</span>
             <span style="font-weight:bold;color:#448aff;">{new_lows}</span>
         </div>
+        <div>
+            <span style="display:block;color:#999;font-size:11px;">50일선 상회</span>
+            <span style="font-weight:bold;color:#333;">{pct_above_50:.1f}%</span>
+        </div>
+        <div>
+            <span style="display:block;color:#999;font-size:11px;">200일선 상회</span>
+            <span style="font-weight:bold;color:#333;">{pct_above_200:.1f}%</span>
+        </div>
+        <div>
+            <span style="display:block;color:#999;font-size:11px;">Breadth Score</span>
+            <span style="font-weight:bold;color:{sentiment_color};">{score:+d}</span>
+        </div>
+    </div>
+
+    <div style="margin-top:12px;padding:10px;background:#fff;border-radius:8px;font-size:12px;color:#555;line-height:1.55;">
+        <strong>판정 기준</strong><br/>
+        1) Adv/Decl 비율, 2) 52주 High/Low 비율, 3) 50일선 상회 비율, 4) 200일선 상회 비율을 점수화합니다.<br/>
+        총점 +4 이상: 강세 우위, -4 이하: 약세 우위, 그 사이는 중립/혼조로 분류합니다.
     </div>
 </div>
 """
     return html
+
+
+def _safe_period_return(series: pd.Series, bars: int) -> float:
+    if len(series.dropna()) <= bars:
+        return float("nan")
+    last = series.iloc[-1]
+    base = series.iloc[-(bars + 1)]
+    if pd.isna(last) or pd.isna(base) or base == 0:
+        return float("nan")
+    return (last / base) - 1.0
+
+
+def build_theme_tracker() -> str:
+    """대표 테마 ETF의 기간별 수익률 요약."""
+    tickers = list(THEME_ETF_MAP.values())
+    if not tickers:
+        return ""
+
+    try:
+        raw = yf.download(tickers, period="1y", auto_adjust=True, progress=False)
+    except Exception:
+        return ""
+    if raw.empty:
+        return ""
+
+    if isinstance(raw.columns, pd.MultiIndex):
+        if "Close" in raw.columns.get_level_values(0):
+            close_df = raw.xs("Close", axis=1, level=0)
+        else:
+            close_df = raw.xs(raw.columns.levels[0][0], axis=1, level=0)
+    else:
+        close_df = raw["Close"].to_frame() if "Close" in raw.columns else raw
+
+    if isinstance(close_df, pd.Series):
+        close_df = close_df.to_frame()
+
+    rows = []
+    for theme, etf in THEME_ETF_MAP.items():
+        if etf not in close_df.columns:
+            continue
+        col = close_df[etf].dropna()
+        if len(col) < 3:
+            continue
+
+        ytd_ret = float("nan")
+        ytd_window = col[col.index.year == col.index[-1].year]
+        if len(ytd_window) > 1 and ytd_window.iloc[0] != 0:
+            ytd_ret = (ytd_window.iloc[-1] / ytd_window.iloc[0]) - 1.0
+
+        rows.append(
+            {
+                "Theme": theme,
+                "ETF": etf,
+                "Today": _safe_period_return(col, 1),
+                "1W": _safe_period_return(col, 5),
+                "1M": _safe_period_return(col, 21),
+                "3M": _safe_period_return(col, 63),
+                "YTD": ytd_ret,
+            }
+        )
+
+    if not rows:
+        return ""
+
+    df = pd.DataFrame(rows).sort_values("Today", ascending=False).reset_index(drop=True)
+
+    def fmt(v: float) -> str:
+        if pd.isna(v):
+            return "-"
+        color = "#d32f2f" if v > 0 else "#1976d2" if v < 0 else "#757575"
+        return f"<span style='color:{color};font-weight:600;'>{v * 100:+.2f}%</span>"
+
+    for col in ["Today", "1W", "1M", "3M", "YTD"]:
+        df[col] = df[col].apply(fmt)
+
+    table = df[["Theme", "ETF", "Today", "1W", "1M", "3M", "YTD"]].to_html(
+        index=False, escape=False, border=1, justify="center"
+    )
+
+    return (
+        '<div style="margin:10px 0;padding:15px;border:1px solid #e0e0e0;border-radius:10px;background-color:#ffffff;">'
+        '<h3 style="margin:0 0 10px 0;color:#333;">Theme Tracker (ETF Proxy)</h3>'
+        "<p style='margin:0 0 10px 0;color:#666;font-size:12px;'>테마별 대표 ETF 수익률로 상대 강도를 비교합니다.</p>"
+        f'<div class="rs-table-wrap">{table}</div>'
+        "</div>"
+    )
+
+
+def build_industry_rank_table(df_prices: pd.DataFrame, rs_df: pd.DataFrame) -> str:
+    """Sector를 Industry 대체 지표로 사용한 기간별 랭킹."""
+    if len(df_prices) < 252 or rs_df.empty:
+        return ""
+
+    sector_map = rs_df.set_index("Ticker")["Sector"].to_dict()
+    sector_cols = [c for c in df_prices.columns if c in sector_map]
+    if not sector_cols:
+        return ""
+
+    returns = df_prices[sector_cols].pct_change()
+    grouped = returns.T.groupby(pd.Series(sector_map)).mean().T.dropna(how="all")
+    if grouped.empty:
+        return ""
+
+    horizons = {"1D": 1, "1W": 5, "1M": 21, "3M": 63, "6M": 126, "12M": 252}
+    rank_df = pd.DataFrame({"Sector": grouped.columns})
+
+    for label, bars in horizons.items():
+        if len(grouped) <= bars:
+            rank_df[label] = "-"
+            continue
+        period_ret = ((1 + grouped).rolling(bars).apply(lambda x: x.prod(), raw=True).iloc[-1] - 1)
+        rank_df[label] = period_ret.rank(ascending=False, method="min").astype("Int64")
+
+    if str(rank_df["1W"].dtype) == "Int64" and str(rank_df["1M"].dtype) == "Int64":
+        delta = rank_df["1M"] - rank_df["1W"]
+        rank_df["Rank Change"] = delta.apply(
+            lambda x: f"+{int(x)}" if pd.notna(x) and x > 0 else str(int(x)) if pd.notna(x) else "-"
+        )
+    else:
+        rank_df["Rank Change"] = "-"
+
+    rank_df = rank_df.sort_values("1D")
+    table = rank_df[["Sector", "1D", "1W", "1M", "3M", "6M", "12M", "Rank Change"]].to_html(
+        index=False, escape=False, border=1, justify="center"
+    )
+    return (
+        '<div style="margin:10px 0;padding:15px;border:1px solid #e0e0e0;border-radius:10px;background-color:#ffffff;">'
+        '<h3 style="margin:0 0 10px 0;color:#333;">Industry Rank (Sector Proxy)</h3>'
+        "<p style='margin:0 0 10px 0;color:#666;font-size:12px;'>섹터 평균 수익률 순위를 기간별로 비교합니다.</p>"
+        f'<div class="rs-table-wrap">{table}</div>'
+        "</div>"
+    )
 
 
 def get_sector_avg_return(df_prices, rs_df):
@@ -650,6 +844,8 @@ def build_combined_post(date_str, nasdaq_rs, sp500_rs, nasdaq_prices, sp500_pric
     
     # --- Market Breadth (S&P 500 기준) ---
     breadth_html = build_market_breadth(sp500_prices, "S&P 500")
+    theme_html = build_theme_tracker()
+    industry_rank_html = build_industry_rank_table(sp500_prices, sp500_rs)
     
     # --- Sector Performance ---
     sector_perf = get_sector_avg_return(sp500_prices, sp500_rs)
@@ -773,6 +969,9 @@ def build_combined_post(date_str, nasdaq_rs, sp500_rs, nasdaq_prices, sp500_pric
     intro_html = f"""
 <p><strong>{date_str} DAILY MARKET BRIEF</strong></p>
 <p>오늘의 시장 브리핑과 상대강도(RS) 분석 리포트입니다.</p>
+<p style="font-size:12px;color:#666;">
+강세/약세 표기는 시장 확산 지표(상승/하락 비율, 52주 신고가/신저가 비율, 50일/200일선 상회 비율) 점수 합산 기준으로 분류했습니다.
+</p>
 """
     disclaimer_html = """
 <p style="font-size:12px;color:#888;margin-top:20px;">
@@ -784,7 +983,9 @@ def build_combined_post(date_str, nasdaq_rs, sp500_rs, nasdaq_prices, sp500_pric
         style_html
         + intro_html
         + breadth_html
+        + theme_html
         + sector_html
+        + industry_rank_html
         + "<hr style='margin:20px 0;border:0;border-top:1px solid #eee;'/>"
         + f'<h3>🚀 NASDAQ 100 상대강도 TOP {TOP_N}</h3>'
         + f'<div class="rs-table-wrap">{nasdaq_table}</div>'
