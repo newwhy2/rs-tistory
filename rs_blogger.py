@@ -21,7 +21,7 @@ BLOGGER_BLOG_ID = os.getenv("BLOGGER_BLOG_ID", "")
 # ====== RS 파라미터 ======
 # 252 거래일(약 1년)까지 써야 해서 넉넉하게 260일로 설정
 LOOKBACK_DAYS = 260
-TOP_N = 30
+TOP_N = 50
 QUALITY_TOP_N = 30
 OUTPUT_DIR_NAME = "output"
 DATA_DIR_NAME = "data"
@@ -701,7 +701,7 @@ def _safe_period_return(series: pd.Series, bars: int) -> float:
 
 
 def build_theme_tracker() -> str:
-    """대표 테마 ETF의 기간별 수익률 요약."""
+    """대표 테마 ETF의 기간별 수익률 + RS/RS변동 요약."""
     tickers = list(THEME_ETF_MAP.values())
     if not tickers:
         return ""
@@ -724,6 +724,27 @@ def build_theme_tracker() -> str:
     if isinstance(close_df, pd.Series):
         close_df = close_df.to_frame()
 
+    # ETF 간 상대강도(RS): 3M 수익률 백분위(1~99)
+    ret_3m_today = {}
+    ret_3m_prev = {}
+    for _, etf in THEME_ETF_MAP.items():
+        if etf not in close_df.columns:
+            continue
+        col = close_df[etf].dropna()
+        if len(col) >= 64:
+            ret_3m_today[etf] = (col.iloc[-1] / col.iloc[-64]) - 1.0
+        if len(col) >= 65:
+            ret_3m_prev[etf] = (col.iloc[-2] / col.iloc[-65]) - 1.0
+
+    rs_today = {}
+    rs_prev = {}
+    if ret_3m_today:
+        s = pd.Series(ret_3m_today)
+        rs_today = ((s.rank(pct=True) * 98) + 1).round(0).astype(int).to_dict()
+    if ret_3m_prev:
+        s = pd.Series(ret_3m_prev)
+        rs_prev = ((s.rank(pct=True) * 98) + 1).round(0).astype(int).to_dict()
+
     rows = []
     for theme, etf in THEME_ETF_MAP.items():
         if etf not in close_df.columns:
@@ -741,6 +762,8 @@ def build_theme_tracker() -> str:
             {
                 "Theme": theme,
                 "ETF": etf,
+                "RS": rs_today.get(etf, 0),
+                "RS_Change": rs_today.get(etf, 0) - rs_prev.get(etf, rs_today.get(etf, 0)),
                 "Today": _safe_period_return(col, 1),
                 "1W": _safe_period_return(col, 5),
                 "1M": _safe_period_return(col, 21),
@@ -763,7 +786,20 @@ def build_theme_tracker() -> str:
     for col in ["Today", "1W", "1M", "3M", "YTD"]:
         df[col] = df[col].apply(fmt)
 
-    table = df[["Theme", "ETF", "Today", "1W", "1M", "3M", "YTD"]].to_html(
+    def fmt_rs_change(v: int) -> str:
+        if pd.isna(v):
+            return "-"
+        vi = int(v)
+        if vi > 0:
+            return f"<span style='color:#d32f2f;font-weight:600;'>+{vi}</span>"
+        if vi < 0:
+            return f"<span style='color:#1976d2;font-weight:600;'>{vi}</span>"
+        return "<span style='color:#757575;'>0</span>"
+
+    df["RS"] = df["RS"].fillna(0).astype(int)
+    df["RS변동"] = df["RS_Change"].apply(fmt_rs_change)
+
+    table = df[["Theme", "ETF", "RS", "RS변동", "Today", "1W", "1M", "3M", "YTD"]].to_html(
         index=False, escape=False, border=1, justify="center"
     )
 
@@ -786,30 +822,47 @@ def build_industry_rank_table(df_prices: pd.DataFrame, rs_df: pd.DataFrame) -> s
     if not sector_cols:
         return ""
 
-    returns = df_prices[sector_cols].pct_change()
-    grouped = returns.T.groupby(pd.Series(sector_map)).mean().T.dropna(how="all")
-    if grouped.empty:
+    px = df_prices[sector_cols].copy()
+    returns = px.pct_change()
+    sector_ret = returns.T.groupby(pd.Series(sector_map)).mean().T.dropna(how="all")
+    if sector_ret.empty:
         return ""
 
     horizons = {"1D": 1, "1W": 5, "1M": 21, "3M": 63, "6M": 126, "12M": 252}
-    rank_df = pd.DataFrame({"Sector": grouped.columns})
+    rank_df = pd.DataFrame({"Sector": sector_ret.columns})
+
+    # 누적 수익률 지수화로 기간수익률 계산(빈값 방지)
+    sector_curve = (1 + sector_ret.fillna(0)).cumprod()
 
     for label, bars in horizons.items():
-        if len(grouped) <= bars:
+        if len(sector_curve) <= bars:
             rank_df[label] = "-"
             continue
-        period_ret = ((1 + grouped).rolling(bars).apply(lambda x: x.prod(), raw=True).iloc[-1] - 1)
-        rank_df[label] = period_ret.rank(ascending=False, method="min").astype("Int64")
+        period_ret = (sector_curve.iloc[-1] / sector_curve.iloc[-(bars + 1)]) - 1.0
+        rank_raw = period_ret.rank(ascending=False, method="min")
+        rank_df[label] = rank_raw.apply(lambda x: int(x) if pd.notna(x) else "-")
 
-    if str(rank_df["1W"].dtype) == "Int64" and str(rank_df["1M"].dtype) == "Int64":
-        delta = rank_df["1M"] - rank_df["1W"]
-        rank_df["Rank Change"] = delta.apply(
-            lambda x: f"+{int(x)}" if pd.notna(x) and x > 0 else str(int(x)) if pd.notna(x) else "-"
-        )
-    else:
-        rank_df["Rank Change"] = "-"
+    def parse_int(x):
+        try:
+            return int(x)
+        except Exception:
+            return None
 
-    rank_df = rank_df.sort_values("1D")
+    rc = []
+    for _, row in rank_df.iterrows():
+        r1w = parse_int(row["1W"])
+        r1m = parse_int(row["1M"])
+        if r1w is None or r1m is None:
+            rc.append("-")
+            continue
+        delta = r1m - r1w
+        rc.append(f"+{delta}" if delta > 0 else str(delta))
+    rank_df["Rank Change"] = rc
+
+    rank_df = rank_df.sort_values(
+        by="1D",
+        key=lambda s: pd.to_numeric(s, errors="coerce").fillna(9999),
+    )
     table = rank_df[["Sector", "1D", "1W", "1M", "3M", "6M", "12M", "Rank Change"]].to_html(
         index=False, escape=False, border=1, justify="center"
     )
@@ -1552,9 +1605,10 @@ def build_combined_post(date_str, nasdaq_rs, sp500_rs, nasdaq_prices, sp500_pric
     sector_rank_map = dict(zip(all_sector_df["Sector"], all_sector_df["순위"]))
 
     # --- 테이블 생성 함수 ---
-    def format_table(top_df, df_prices_local):
+    def format_table(top_df, all_prices_local):
         top_df = top_df.copy()
         top_df["티커"] = top_df["Ticker"]
+        top_df["소속"] = top_df["Universe"]
         top_df["회사명"] = top_df["Name"]
         top_df["섹터"] = top_df["Sector"].apply(
             lambda s: f"{s}({sector_rank_map.get(s, '?')}위)"
@@ -1574,10 +1628,9 @@ def build_combined_post(date_str, nasdaq_rs, sp500_rs, nasdaq_prices, sp500_pric
             return "-"
         top_df["RS변동"] = top_df["RS_Change"].apply(format_rs_change)
 
-        if df_prices_local is not None:
-            top_df["셋업"] = top_df["Ticker"].apply(lambda t: detect_setup(df_prices_local, t))
-        else:
-            top_df["셋업"] = "-"
+        top_df["셋업"] = top_df["Ticker"].apply(
+            lambda t: detect_setup(all_prices_local, t) if (all_prices_local is not None and t in all_prices_local.columns) else "-"
+        )
 
         top_df["1개월 수익률"] = top_df["Return_1M"].apply(format_percent)
         top_df["3개월 수익률"] = top_df["Return_3M"].apply(format_percent)
@@ -1587,21 +1640,27 @@ def build_combined_post(date_str, nasdaq_rs, sp500_rs, nasdaq_prices, sp500_pric
         top_df["12개월 RS"] = top_df["RS_12M"].fillna(0).astype(int)
 
         display_df = top_df[[
-            "티커", "회사명", "섹터",
+            "티커", "소속", "회사명", "섹터",
             "RS 등급", "RS변동", "셋업",
             "1개월 수익률", "3개월 수익률", "12개월 수익률",
             "1개월 RS", "3개월 RS", "12개월 RS",
         ]]
         return display_df.to_html(index=False, escape=False, border=1, justify="center")
 
-    # --- NASDAQ / S&P 테이블 ---
-    nasdaq_top = nasdaq_rs.head(TOP_N).copy()
-    nasdaq_tickers = set(nasdaq_top["Ticker"])
-    sp500_filtered = sp500_rs[~sp500_rs["Ticker"].isin(nasdaq_tickers)]
-    sp500_top = sp500_filtered.head(TOP_N).copy()
+    # --- NASDAQ + S&P 통합 테이블 ---
+    nasdaq_union = nasdaq_rs.copy()
+    nasdaq_union["Universe"] = "NASDAQ 100"
+    sp500_union = sp500_rs.copy()
+    sp500_union["Universe"] = "S&P 500"
 
-    nasdaq_table = format_table(nasdaq_top, nasdaq_prices)
-    sp500_table = format_table(sp500_top, sp500_prices)
+    combined_union = pd.concat([nasdaq_union, sp500_union], ignore_index=True)
+    combined_union = combined_union.sort_values("RS_Rating", ascending=False)
+    combined_union = combined_union.drop_duplicates(subset=["Ticker"], keep="first").reset_index(drop=True)
+    combined_top = combined_union.head(TOP_N).copy()
+
+    all_prices_for_table = pd.concat([nasdaq_prices, sp500_prices], axis=1)
+    all_prices_for_table = all_prices_for_table.loc[:, ~all_prices_for_table.columns.duplicated()]
+    combined_table = format_table(combined_top, all_prices_for_table)
 
     # --- 섹터 전체 요약 ---
     sector_summary = (
@@ -1651,11 +1710,8 @@ def build_combined_post(date_str, nasdaq_rs, sp500_rs, nasdaq_prices, sp500_pric
         + sector_html
         + industry_rank_html
         + "<hr style='margin:20px 0;border:0;border-top:1px solid #eee;'/>"
-        + f'<h3>🚀 NASDAQ 100 상대강도 TOP {TOP_N}</h3>'
-        + f'<div class="rs-table-wrap">{nasdaq_table}</div>'
-        + "<br/>"
-        + f'<h3>🛡️ S&P 500 상대강도 TOP {TOP_N} (NASDAQ 중복 제외)</h3>'
-        + f'<div class="rs-table-wrap">{sp500_table}</div>'
+        + f'<h3>🚀 통합 상대강도 TOP {TOP_N} (NASDAQ 100 + S&P 500)</h3>'
+        + f'<div class="rs-table-wrap">{combined_table}</div>'
         + "<br/>"
         + '<h3>📊 섹터별 강도 요약 (S&P 500 기준)</h3>'
         + f'<div class="rs-table-wrap">{sector_table_html}</div>'
