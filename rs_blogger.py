@@ -699,10 +699,16 @@ def build_combined_post(date_str, nasdaq_rs, sp500_rs, nasdaq_prices, sp500_pric
         top_df["섹터"] = top_df["Sector"].apply(
             lambda s: f"{s}({sector_rank_map.get(s, '?')}위)"
         )
-        top_df["RS 등급"] = top_df["RS_Rating"].astype(int)
+        top_df["RS 등급"] = top_df["RS_Rating"].fillna(0).astype(int)
 
         def format_rs_change(val):
-            v = int(val)
+            if pd.isna(val) or val == "":
+                return "-"
+            try:
+                v = int(float(val))
+            except ValueError:
+                return "-"
+                
             if v > 0: return f"<span style='color:#d32f2f'>+{v}</span>"
             elif v < 0: return f"<span style='color:#1976d2'>{v}</span>"
             return "-"
@@ -716,9 +722,9 @@ def build_combined_post(date_str, nasdaq_rs, sp500_rs, nasdaq_prices, sp500_pric
         top_df["1개월 수익률"] = top_df["Return_1M"].apply(format_percent)
         top_df["3개월 수익률"] = top_df["Return_3M"].apply(format_percent)
         top_df["12개월 수익률"] = top_df["Return_12M"].apply(format_percent)
-        top_df["1개월 RS"] = top_df["RS_1M"].astype(int)
-        top_df["3개월 RS"] = top_df["RS_3M"].astype(int)
-        top_df["12개월 RS"] = top_df["RS_12M"].astype(int)
+        top_df["1개월 RS"] = top_df["RS_1M"].fillna(0).astype(int)
+        top_df["3개월 RS"] = top_df["RS_3M"].fillna(0).astype(int)
+        top_df["12개월 RS"] = top_df["RS_12M"].fillna(0).astype(int)
 
         display_df = top_df[[
             "티커", "회사명", "섹터",
