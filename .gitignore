@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# 환경변수 / 시크릿
+.env
+client_secret.json
+client_secret_*.json
+credentials_output.txt
+get_refresh_token*.py
+
+# 출력 파일
+output/
+
+# IDE
+.vscode/
+.idea/

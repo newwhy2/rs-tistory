@@ -1,0 +1,33 @@
+name: Daily RS Report
+
+on:
+  schedule:
+    # UTC 21:00 = KST 06:00, 월~금만 실행
+    - cron: '0 21 * * 1-5'
+  workflow_dispatch:  # 수동 실행 버튼
+
+jobs:
+  generate-and-post:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run RS Report & Post to Blogger
+        env:
+          BLOGGER_AUTO_POST: 'true'
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          BLOGGER_BLOG_ID: ${{ secrets.BLOGGER_BLOG_ID }}
+        run: python rs_blogger.py
