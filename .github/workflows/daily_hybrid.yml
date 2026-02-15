@@ -1,13 +1,13 @@
-name: Daily Quant Report
+name: Daily Hybrid Report
 
 on:
   schedule:
-    # UTC 21:00 = KST 06:00, 월~금만 실행
-    - cron: '0 21 * * 1-5'
-  workflow_dispatch:  # 수동 실행 버튼
+    # UTC 21:10 = KST 06:10, 월~금
+    - cron: '10 21 * * 1-5'
+  workflow_dispatch:
 
 jobs:
-  generate-and-post-quant:
+  generate-and-post-hybrid:
     runs-on: ubuntu-latest
 
     steps:
@@ -23,11 +23,11 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run Quant Report & Post to Blogger
+      - name: Run Hybrid Report & Post to Blogger
         env:
           BLOGGER_AUTO_POST: 'true'
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
           BLOGGER_BLOG_ID: ${{ secrets.BLOGGER_BLOG_ID }}
-        run: python rs_blogger.py --mode quant
+        run: python rs_blogger.py --mode hybrid

@@ -1683,11 +1683,18 @@ def run_universe(index_name, loader_func, output_dir=None): # output_dir 호환�
 def main():
     parser = argparse.ArgumentParser(description="RS + Quality reporting pipeline")
     parser.add_argument(
+        "--mode",
+        choices=["all", "quant", "quality", "hybrid", "weekly-deep"],
+        default="all",
+        help="Run mode: all|quant|quality|hybrid|weekly-deep",
+    )
+    parser.add_argument(
         "--weekly-deep",
         action="store_true",
-        help="Generate weekly deep research context only",
+        help="(deprecated) same as --mode weekly-deep",
     )
     args = parser.parse_args()
+    mode = "weekly-deep" if args.weekly_deep else args.mode
 
     today = dt.date.today()
     date_str = today.strftime("%Y-%m-%d")
@@ -1711,96 +1718,96 @@ def main():
     sector_rank_map = dict(zip(sector_rank_df["Sector"], sector_rank_df["순위"]))
 
     # 주간 모드: deep context만 생성/저장
-    if args.weekly_deep:
+    if mode == "weekly-deep":
         print("\n===== Weekly Deep Context 생성 시작 =====")
         deep_df = generate_weekly_deep_context(date_str, quality_universe, sector_rank_map)
         save_weekly_deep_context(deep_df)
         print("Weekly Deep Context 생성 완료")
         return
 
-    # 통합 리포트 생성/포스팅
-    print("\n통합 리포트 생성 중...")
-    combined_html = build_combined_post(
-        date_str, nasdaq_rs, sp500_rs, nasdaq_prices, sp500_prices
-    )
-    combined_title = f"{date_str} 미국 주식 시장 브리핑 & 상대강도 리포트"
-    path = os.path.join(output_dir, f"{date_str}_combined.html")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(f"<!-- TITLE: {combined_title} -->\n")
-        f.write(combined_html)
-    print(f"통합 리포트 HTML 저장됨: {path}")
+    if mode in ["all", "quant"]:
+        print("\n통합 리포트 생성 중...")
+        combined_html = build_combined_post(
+            date_str, nasdaq_rs, sp500_rs, nasdaq_prices, sp500_prices
+        )
+        combined_title = f"{date_str} 미국 주식 시장 브리핑 & 상대강도 리포트"
+        path = os.path.join(output_dir, f"{date_str}_combined.html")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"<!-- TITLE: {combined_title} -->\n")
+            f.write(combined_html)
+        print(f"통합 리포트 HTML 저장됨: {path}")
 
-    if BLOGGER_AUTO_POST:
-        print("\n===== Blogger 자동 포스팅 시작 =====")
-        post_to_blogger(combined_title, combined_html)
-    else:
-        print("\nBlogger 자동 포스팅이 비활성화되어 있습니다.")
-        print("자동 포스팅을 원하면 환경변수 BLOGGER_AUTO_POST=true 로 설정하세요.")
+        if BLOGGER_AUTO_POST:
+            print("\n===== Blogger 자동 포스팅 시작 (Quant) =====")
+            post_to_blogger(combined_title, combined_html)
 
-    # Quality 기본점수 계산
-    print("\n===== Quality 리포트 생성 시작 =====")
-    all_prices = pd.concat([nasdaq_prices, sp500_prices], axis=1)
-    all_prices = all_prices.loc[:, ~all_prices.columns.duplicated()]
-    quality_df = compute_quality_score(
-        df_candidates=quality_universe,
-        df_prices=all_prices,
-        sector_rank_map=sector_rank_map,
-    )
+    needs_quality_base = mode in ["all", "quality", "hybrid"]
+    if needs_quality_base:
+        print("\n===== Quality 리포트 생성 시작 =====")
+        all_prices = pd.concat([nasdaq_prices, sp500_prices], axis=1)
+        all_prices = all_prices.loc[:, ~all_prices.columns.duplicated()]
+        quality_df = compute_quality_score(
+            df_candidates=quality_universe,
+            df_prices=all_prices,
+            sector_rank_map=sector_rank_map,
+        )
 
-    # 일간 Agent 신호
-    try:
-        qual_signal_df = run_agent_qual_signals(date_str, quality_df["Ticker"].tolist())
-    except Exception as e:
-        print(f"AGENT_SIGNAL_FETCH_FAILED: {e}")
-        qual_signal_df = pd.DataFrame(columns=["date", "ticker", "signal_type", "direction", "confidence", "source_url", "summary"])
-    if qual_signal_df.empty:
-        print("AGENT_SIGNAL_FETCH_FAILED: no usable daily signals")
-
-    qual_signal_path = os.path.join(output_dir, f"{date_str}_qual_signals.json")
-    with open(qual_signal_path, "w", encoding="utf-8") as f:
-        json.dump(qual_signal_df.to_dict(orient="records"), f, ensure_ascii=False, indent=2)
-    print(f"Agent signals saved: {qual_signal_path}")
-
-    # 주간 Deep 컨텍스트 로드
-    deep_theme_df = run_deep_research_weekly_context(date_str)
-
-    # 보정 계산/결합
-    ticker_sector_map = dict(zip(quality_df["Ticker"], quality_df["Sector"]))
-    qual_adjustment_df = compute_qual_adjustment(
-        quality_df=quality_df,
-        qual_signal_df=qual_signal_df,
-        deep_theme_df=deep_theme_df,
-        sector_map=ticker_sector_map,
-    )
-    adjusted_quality_df = merge_quality_with_adjustment(quality_df, qual_adjustment_df)
-
-    # 기존 품질 리포트(기본 점수) 보존
-    post_quality_report(
-        date_str=date_str,
-        quality_df=quality_df.assign(
+        base_quality_df = quality_df.assign(
             daily_adjust=0,
             weekly_adjust=0,
             total_adjust_clipped=0,
             FinalQualityScore=quality_df["QualityScore"],
-        ),
-        output_dir=output_dir,
-        quality_filename="quality",
-        publish=False,
-    )
+        )
 
-    # 보정 반영 품질 리포트(최종)
-    try:
         post_quality_report(
             date_str=date_str,
-            quality_df=adjusted_quality_df,
+            quality_df=base_quality_df,
             output_dir=output_dir,
-            quality_filename="quality_with_adjustment",
+            quality_filename="quality",
+            publish=(mode in ["all", "quality"]),
         )
-        if BLOGGER_AUTO_POST:
-            print("Quality 리포트 포스팅 완료")
-    except Exception as e:
-        print(f"QUALITY_POST_FAILED: {e}")
-        raise
+
+    if mode in ["all", "hybrid"]:
+        # 일간 Agent 신호
+        try:
+            qual_signal_df = run_agent_qual_signals(date_str, quality_df["Ticker"].tolist())
+        except Exception as e:
+            print(f"AGENT_SIGNAL_FETCH_FAILED: {e}")
+            qual_signal_df = pd.DataFrame(columns=["date", "ticker", "signal_type", "direction", "confidence", "source_url", "summary"])
+        if qual_signal_df.empty:
+            print("AGENT_SIGNAL_FETCH_FAILED: no usable daily signals")
+
+        qual_signal_path = os.path.join(output_dir, f"{date_str}_qual_signals.json")
+        with open(qual_signal_path, "w", encoding="utf-8") as f:
+            json.dump(qual_signal_df.to_dict(orient="records"), f, ensure_ascii=False, indent=2)
+        print(f"Agent signals saved: {qual_signal_path}")
+
+        # 주간 Deep 컨텍스트 로드
+        deep_theme_df = run_deep_research_weekly_context(date_str)
+
+        # 보정 계산/결합
+        ticker_sector_map = dict(zip(quality_df["Ticker"], quality_df["Sector"]))
+        qual_adjustment_df = compute_qual_adjustment(
+            quality_df=quality_df,
+            qual_signal_df=qual_signal_df,
+            deep_theme_df=deep_theme_df,
+            sector_map=ticker_sector_map,
+        )
+        adjusted_quality_df = merge_quality_with_adjustment(quality_df, qual_adjustment_df)
+
+        try:
+            post_quality_report(
+                date_str=date_str,
+                quality_df=adjusted_quality_df,
+                output_dir=output_dir,
+                quality_filename="quality_with_adjustment",
+                publish=True,
+            )
+            if BLOGGER_AUTO_POST:
+                print("Quality 리포트 포스팅 완료 (Hybrid)")
+        except Exception as e:
+            print(f"QUALITY_POST_FAILED: {e}")
+            raise
 
 
 if __name__ == "__main__":
