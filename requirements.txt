@@ -3,6 +3,7 @@ pandas
 numpy
 requests
 python-dotenv
+lxml
 google-api-python-client
 google-auth
 google-auth-oauthlib
