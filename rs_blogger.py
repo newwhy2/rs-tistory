@@ -489,19 +489,13 @@ def save_post_html(output_dir, date_str, index_name, title, content_html):
         f.write(f"<!-- TITLE: {title} -->\n")
         f.write(content_html)
 
-    print(f"{index_name} 리포트 HTML 저장됨: {path}")
-    return path
-
-
 def get_blogger_access_token():
     """OAuth2 refresh token으로 새 access token을 발급받는다."""
     client_id = GOOGLE_CLIENT_ID.strip()
     client_secret = GOOGLE_CLIENT_SECRET.strip()
     refresh_token = GOOGLE_REFRESH_TOKEN.strip()
 
-    print(f"[DEBUG] client_id: {client_id[:20]}..." if client_id else "[DEBUG] client_id: EMPTY!")
-    print(f"[DEBUG] client_secret: {client_secret[:10]}..." if client_secret else "[DEBUG] client_secret: EMPTY!")
-    print(f"[DEBUG] refresh_token: {refresh_token[:20]}..." if refresh_token else "[DEBUG] refresh_token: EMPTY!")
+    # print(f"[DEBUG] client_id: {client_id[:20]}..." if client_id else "[DEBUG] client_id: EMPTY!")
 
     resp = requests.post(
         "https://oauth2.googleapis.com/token",
@@ -542,20 +536,266 @@ def post_to_blogger(title, content_html):
         "content": content_html,
     }
 
-    resp = requests.post(url, headers=headers, json=body, timeout=60)
-    resp.raise_for_status()
+    try:
+        resp = requests.post(url, headers=headers, json=body, timeout=60)
+        resp.raise_for_status()
+        post_data = resp.json()
+        post_url = post_data.get("url", "(URL 알 수 없음)")
+        print(f"Blogger 포스팅 성공: {post_url}")
+        return post_url
+    except Exception as e:
+        print(f"Blogger 포스팅 실패: {e}")
+        return None
 
-    post_data = resp.json()
-    post_url = post_data.get("url", "(URL 알 수 없음)")
-    print(f"Blogger 포스팅 성공: {post_url}")
-    return post_url
+
+def build_market_breadth(df_prices: pd.DataFrame, index_name: str) -> str:
+    """시장 브리핑용 데이터 생성 (등락, 신고가 등)."""
+    if len(df_prices) < 252:
+        return ""
+
+    latest = df_prices.iloc[-1]
+    prev = df_prices.iloc[-2]
+    
+    # 1. 등락 (Advance/Decline)
+    changes = latest - prev
+    adv = (changes > 0).sum()
+    dec = (changes < 0).sum()
+    unch = (changes == 0).sum()
+    total = adv + dec + unch
+    
+    adv_pct = adv / total * 100
+    dec_pct = dec / total * 100
+    
+    # 2. 52주 신고가/신저가
+    # 최근 252일 고가/저가 확인
+    high_52w = df_prices.tail(252).max()
+    low_52w = df_prices.tail(252).min()
+    
+    # 오늘 고가/저가가 52주 고가/저가 경신 여부 (종가 기준 근접도 체크)
+    # 엄밀히는 장중 고가를 봐야하나 데이터가 종가뿐이므로 종가 기준으로 '신고가 영역' 판단
+    # 52주 고가의 99% 이상이면 신고가 영역으로 간주
+    new_highs = (latest >= high_52w * 0.99).sum()
+    new_lows = (latest <= low_52w * 1.01).sum()
+
+    # 3. 시장 심리 (Sentiment) - 단순 등락 비율 기반
+    if adv > dec * 1.2:
+        sentiment = "강세장 (Bullish) 🔥"
+        sentiment_color = "#d32f2f"
+    elif dec > adv * 1.2:
+        sentiment = "약세장 (Bearish) ❄️"
+        sentiment_color = "#1976d2"
+    else:
+        sentiment = "관망세 (Neutral) ⚖️"
+        sentiment_color = "#757575"
+
+    # HTML 생성
+    html = f"""
+<div style="margin:10px 0;padding:15px;border:1px solid #e0e0e0;border-radius:10px;background-color:#f9f9f9;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+        <h3 style="margin:0;color:#333;">📊 {index_name} Market Breadth</h3>
+        <span style="font-size:13px;font-weight:bold;color:{sentiment_color};border:1px solid {sentiment_color};padding:2px 8px;border-radius:12px;">{sentiment}</span>
+    </div>
+    
+    <!-- 등락 비율 -->
+    <div style="margin-bottom:15px;">
+        <div style="display:flex;justify-content:space-between;font-size:13px;color:#555;margin-bottom:4px;">
+            <span>상승 {adv} ({adv_pct:.1f}%)</span>
+            <span>하락 {dec} ({dec_pct:.1f}%)</span>
+        </div>
+        <div style="display:flex;height:10px;border-radius:5px;overflow:hidden;background:#eee;">
+            <div style="width:{adv_pct}%;background:#ff5252;"></div>
+            <div style="width:{dec_pct}%;background:#448aff;"></div>
+        </div>
+    </div>
+
+    <!-- 신고가/신저가 -->
+    <div style="display:flex;justify-content:space-around;text-align:center;font-size:14px;">
+        <div>
+            <span style="display:block;color:#999;font-size:11px;">52주 신고가 (Highs)</span>
+            <span style="font-weight:bold;color:#ff5252;">{new_highs}</span>
+        </div>
+        <div>
+            <span style="display:block;color:#999;font-size:11px;">52주 신저가 (Lows)</span>
+            <span style="font-weight:bold;color:#448aff;">{new_lows}</span>
+        </div>
+    </div>
+</div>
+"""
+    return html
 
 
-def run_universe(index_name, loader_func, output_dir):
-    """특정 인덱스(NASDAQ100, S&P 500)에 대해 RS 계산 및 HTML 저장."""
-    today = dt.date.today()
-    date_str = today.strftime("%Y-%m-%d")
+def get_sector_avg_return(df_prices, rs_df):
+    """섹터별 당일 평균 수익률 계산."""
+    latest = df_prices.iloc[-1]
+    prev = df_prices.iloc[-2]
+    returns = (latest - prev) / (prev + 1e-9)
+    
+    # Ticker별 섹터 매핑
+    sector_map = rs_df.set_index("Ticker")["Sector"].to_dict()
+    
+    # 데이터프레임 생성
+    df_ret = pd.DataFrame({"Return": returns})
+    df_ret["Sector"] = df_ret.index.map(sector_map)
+    df_ret = df_ret.dropna()
+    
+    # 섹터별 평균
+    sector_g = df_ret.groupby("Sector")["Return"].mean().reset_index()
+    sector_g = sector_g.sort_values("Return", ascending=False)
+    
+    return sector_g
 
+
+def build_combined_post(date_str, nasdaq_rs, sp500_rs, nasdaq_prices, sp500_prices):
+    """통합 리포트 HTML 생성 (Market Brief 포함)."""
+    
+    # --- Market Breadth (S&P 500 기준) ---
+    breadth_html = build_market_breadth(sp500_prices, "S&P 500")
+    
+    # --- Sector Performance ---
+    sector_perf = get_sector_avg_return(sp500_prices, sp500_rs)
+    top3_sectors = sector_perf.head(3)
+    bottom3_sectors = sector_perf.tail(3).sort_values("Return")
+    
+    def format_sec_ret(row):
+        r = row["Return"] * 100
+        color = "red" if r > 0 else "blue"
+        return f"<li>{row['Sector']}: <span style='color:{color}'>{r:+.2f}%</span></li>"
+        
+    sector_html = f"""
+<div style="margin:10px 0;padding:15px;border:1px solid #e0e0e0;border-radius:10px;background-color:#ffffff;">
+    <h3 style="margin:0 0 10px 0;color:#333;">🏭 Sector Performance</h3>
+    <div style="display:flex;justify-content:space-between;">
+        <div style="width:48%;">
+            <strong style="color:#d32f2f;">▲ 강세 섹터</strong>
+            <ul style="padding-left:20px;margin:5px 0;font-size:13px;">
+                {''.join(top3_sectors.apply(format_sec_ret, axis=1))}
+            </ul>
+        </div>
+        <div style="width:48%;">
+            <strong style="color:#1976d2;">▼ 약세 섹터</strong>
+            <ul style="padding-left:20px;margin:5px 0;font-size:13px;">
+                {''.join(bottom3_sectors.apply(format_sec_ret, axis=1))}
+            </ul>
+        </div>
+    </div>
+</div>
+"""
+
+    # --- 기존 코드: 섹터 순위 맵 ---
+    all_sector_df = (
+        sp500_rs.groupby("Sector")
+        .agg(섹터평균_RS=("RS_Rating", "mean"))
+        .reset_index()
+    )
+    all_sector_df = all_sector_df.sort_values("섹터평균_RS", ascending=False).reset_index(drop=True)
+    all_sector_df["순위"] = range(1, len(all_sector_df) + 1)
+    sector_rank_map = dict(zip(all_sector_df["Sector"], all_sector_df["순위"]))
+
+    # --- 테이블 생성 함수 ---
+    def format_table(top_df, df_prices_local):
+        top_df = top_df.copy()
+        top_df["티커"] = top_df["Ticker"]
+        top_df["회사명"] = top_df["Name"]
+        top_df["섹터"] = top_df["Sector"].apply(
+            lambda s: f"{s}({sector_rank_map.get(s, '?')}위)"
+        )
+        top_df["RS 등급"] = top_df["RS_Rating"].astype(int)
+
+        def format_rs_change(val):
+            v = int(val)
+            if v > 0: return f"<span style='color:#d32f2f'>+{v}</span>"
+            elif v < 0: return f"<span style='color:#1976d2'>{v}</span>"
+            return "-"
+        top_df["RS변동"] = top_df["RS_Change"].apply(format_rs_change)
+
+        if df_prices_local is not None:
+            top_df["셋업"] = top_df["Ticker"].apply(lambda t: detect_setup(df_prices_local, t))
+        else:
+            top_df["셋업"] = "-"
+
+        top_df["1개월 수익률"] = top_df["Return_1M"].apply(format_percent)
+        top_df["3개월 수익률"] = top_df["Return_3M"].apply(format_percent)
+        top_df["12개월 수익률"] = top_df["Return_12M"].apply(format_percent)
+        top_df["1개월 RS"] = top_df["RS_1M"].astype(int)
+        top_df["3개월 RS"] = top_df["RS_3M"].astype(int)
+        top_df["12개월 RS"] = top_df["RS_12M"].astype(int)
+
+        display_df = top_df[[
+            "티커", "회사명", "섹터",
+            "RS 등급", "RS변동", "셋업",
+            "1개월 수익률", "3개월 수익률", "12개월 수익률",
+            "1개월 RS", "3개월 RS", "12개월 RS",
+        ]]
+        return display_df.to_html(index=False, escape=False, border=1, justify="center")
+
+    # --- NASDAQ / S&P 테이블 ---
+    nasdaq_top = nasdaq_rs.head(TOP_N).copy()
+    nasdaq_tickers = set(nasdaq_top["Ticker"])
+    sp500_filtered = sp500_rs[~sp500_rs["Ticker"].isin(nasdaq_tickers)]
+    sp500_top = sp500_filtered.head(TOP_N).copy()
+
+    nasdaq_table = format_table(nasdaq_top, nasdaq_prices)
+    sp500_table = format_table(sp500_top, sp500_prices)
+
+    # --- 섹터 전체 요약 ---
+    sector_summary = (
+        sp500_rs.groupby("Sector")
+        .agg(
+            섹터평균_RS=("RS_Rating", "mean"),
+            종목수=("Ticker", "count"),
+        )
+        .reset_index()
+    )
+    sector_summary["섹터평균_RS"] = sector_summary["섹터평균_RS"].round(1)
+    sector_summary = sector_summary.sort_values("섹터평균_RS", ascending=False).reset_index(drop=True)
+    sector_summary["섹터"] = sector_summary.apply(
+        lambda row: f"{row['Sector']}({sector_rank_map.get(row['Sector'], '?')}위)", axis=1
+    )
+    sector_table_html = sector_summary[["섹터", "섹터평균_RS", "종목수"]].to_html(
+        index=False, escape=False, border=1, justify="center"
+    )
+
+    # --- 최종 조립 ---
+    style_html = """
+<style>
+.rs-table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.rs-table-wrap table { border-collapse: collapse; width: 100%; font-size: 13px; }
+.rs-table-wrap th, .rs-table-wrap td { padding: 5px 8px; white-space: nowrap; border: 1px solid #ddd; }
+.rs-table-wrap th { background: #f5f5f5; font-weight: bold; }
+</style>
+"""
+    intro_html = f"""
+<p><strong>{date_str} DAILY MARKET BRIEF</strong></p>
+<p>오늘의 시장 브리핑과 상대강도(RS) 분석 리포트입니다.</p>
+"""
+    disclaimer_html = """
+<p style="font-size:12px;color:#888;margin-top:20px;">
+<em>※ 본 글은 특정 종목의 매수/매도 추천이 아니며, 정보 제공만을 목적으로 합니다. 투자 판단의 책임은 투자자에게 있습니다.</em>
+</p>
+"""
+
+    content_html = (
+        style_html
+        + intro_html
+        + breadth_html
+        + sector_html
+        + "<hr style='margin:20px 0;border:0;border-top:1px solid #eee;'/>"
+        + f'<h3>🚀 NASDAQ 100 상대강도 TOP {TOP_N}</h3>'
+        + f'<div class="rs-table-wrap">{nasdaq_table}</div>'
+        + "<br/>"
+        + f'<h3>🛡️ S&P 500 상대강도 TOP {TOP_N} (NASDAQ 중복 제외)</h3>'
+        + f'<div class="rs-table-wrap">{sp500_table}</div>'
+        + "<br/>"
+        + '<h3>📊 섹터별 강도 요약 (S&P 500 기준)</h3>'
+        + f'<div class="rs-table-wrap">{sector_table_html}</div>'
+        + disclaimer_html
+    )
+    return content_html
+
+
+def run_universe(index_name, loader_func, output_dir=None): # output_dir 호환성 유지
+    """특정 인덱스에 대해 종목 로드, 가격 다운로드, RS 계산. (데이터만 반환)"""
+    # output_dir 인자는 레거시 호출 호환성을 위해 남겨둠 (사용 안 함)
     print(f"[{index_name}] 종목 리스트 불러오는 중...")
     tickers = loader_func()
     print(f"[{index_name}] 종목 수: {len(tickers)}")
@@ -566,61 +806,39 @@ def run_universe(index_name, loader_func, output_dir):
     print(f"[{index_name}] RS 계산(IBD 스타일) 중...")
     rs_df = compute_rs_ibd_style(df_prices)
 
-    print(f"[{index_name}] 본문 생성 중...")
-    content_html = build_post_content(
-        date_str=date_str,
-        index_name=index_name,
-        rs_df=rs_df,
-        df_prices=df_prices,
-    )
-
-    title = f"{date_str} {index_name} 상대강도 TOP {TOP_N}"
-
-    print(f"[{index_name}] HTML 파일로 저장 중...")
-    path = save_post_html(output_dir, date_str, index_name, title, content_html)
-
-    return title, path, content_html
+    return rs_df, df_prices
 
 
 def main():
+    # output_dir = os.path.join(os.path.dirname(__file__), "output")
+    # os.makedirs(output_dir, exist_ok=True)
+    today = dt.date.today()
+    date_str = today.strftime("%Y-%m-%d")
+
+    # 데이터 수집 (run_universe는 이제 HTML을 저장하지 않고 데이터만 반환)
+    nasdaq_rs, nasdaq_prices = run_universe("NASDAQ 100", load_nasdaq100_universe)
+    sp500_rs, sp500_prices = run_universe("S&P 500", load_sp500_universe)
+
+    # 통합 리포트 생성
+    print("\n통합 리포트 생성 중...")
+    combined_html = build_combined_post(
+        date_str, nasdaq_rs, sp500_rs, nasdaq_prices, sp500_prices
+    )
+    combined_title = f"{date_str} 미국 주식 시장 브리핑 & 상대강도 리포트"
+
+    # 로컬 저장 (디버깅용)
     output_dir = os.path.join(os.path.dirname(__file__), "output")
-
-    # NASDAQ 100
-    nasdaq_title, nasdaq_path, nasdaq_html = run_universe(
-        index_name="NASDAQ 100",
-        loader_func=load_nasdaq100_universe,
-        output_dir=output_dir,
-    )
-
-    # S&P 500
-    sp500_title, sp500_path, sp500_html = run_universe(
-        index_name="S&P 500",
-        loader_func=load_sp500_universe,
-        output_dir=output_dir,
-    )
-
-    print("\n===== 리포트 생성 완료 =====")
-    print(f"1) {nasdaq_title} → {nasdaq_path}")
-    print(f"2) {sp500_title} → {sp500_path}")
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, f"{date_str}_combined.html")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"<!-- TITLE: {combined_title} -->\n")
+        f.write(combined_html)
+    print(f"통합 리포트 HTML 저장됨: {path}")
 
     # Blogger 자동 포스팅
     if BLOGGER_AUTO_POST:
         print("\n===== Blogger 자동 포스팅 시작 =====")
-        today_str = dt.date.today().strftime("%Y-%m-%d")
-
-        # NASDAQ 100 포스팅
-        try:
-            url1 = post_to_blogger(nasdaq_title, nasdaq_html)
-            print(f"NASDAQ 100 포스팅 완료: {url1}")
-        except Exception as e:
-            print(f"NASDAQ 100 포스팅 실패: {e}")
-
-        # S&P 500 포스팅
-        try:
-            url2 = post_to_blogger(sp500_title, sp500_html)
-            print(f"S&P 500 포스팅 완료: {url2}")
-        except Exception as e:
-            print(f"S&P 500 포스팅 실패: {e}")
+        post_to_blogger(combined_title, combined_html)
     else:
         print("\nBlogger 자동 포스팅이 비활성화되어 있습니다.")
         print("자동 포스팅을 원하면 환경변수 BLOGGER_AUTO_POST=true 로 설정하세요.")
