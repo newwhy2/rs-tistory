@@ -1,56 +1,56 @@
 {
-  "updated_at": "2026-02-28T04:44:14.794881Z",
+  "updated_at": "2026-03-07T04:53:12.892256Z",
   "records": [
     {
-      "week": "2026-02-23",
+      "week": "2026-03-02",
       "theme_or_sector": "Energy",
       "thesis": "섹터 리더십 유지 가능성",
-      "evidence": "RS 평균 75.8, 3M 평균수익률 +25.13%",
+      "evidence": "RS 평균 82.5, 3M 평균수익률 +21.67%",
       "risk": "실적 시즌 변동성/밸류에이션 부담",
       "confidence": 0.75,
       "source_url": "https://finance.yahoo.com/"
     },
     {
-      "week": "2026-02-23",
+      "week": "2026-03-02",
+      "theme_or_sector": "Utilities",
+      "thesis": "섹터 리더십 유지 가능성",
+      "evidence": "RS 평균 66.9, 3M 평균수익률 +9.44%",
+      "risk": "실적 시즌 변동성/밸류에이션 부담",
+      "confidence": 0.75,
+      "source_url": "https://finance.yahoo.com/"
+    },
+    {
+      "week": "2026-03-02",
       "theme_or_sector": "Basic Materials",
       "thesis": "섹터 리더십 유지 가능성",
-      "evidence": "RS 평균 66.2, 3M 평균수익률 +21.37%",
+      "evidence": "RS 평균 63.8, 3M 평균수익률 +16.49%",
       "risk": "실적 시즌 변동성/밸류에이션 부담",
       "confidence": 0.75,
       "source_url": "https://finance.yahoo.com/"
     },
     {
-      "week": "2026-02-23",
-      "theme_or_sector": "Industrials",
-      "thesis": "섹터 리더십 유지 가능성",
-      "evidence": "RS 평균 63.4, 3M 평균수익률 +16.01%",
-      "risk": "실적 시즌 변동성/밸류에이션 부담",
-      "confidence": 0.75,
-      "source_url": "https://finance.yahoo.com/"
-    },
-    {
-      "week": "2026-02-23",
-      "theme_or_sector": "Real Estate",
+      "week": "2026-03-02",
+      "theme_or_sector": "Technology",
       "thesis": "섹터 약세/리스크 확대",
-      "evidence": "RS 평균 40.9, 3M 평균수익률 +5.53%",
+      "evidence": "RS 평균 43.8, 3M 평균수익률 -1.95%",
       "risk": "숏커버링/정책 변화 시 급반등 가능",
       "confidence": 0.72,
       "source_url": "https://finance.yahoo.com/"
     },
     {
-      "week": "2026-02-23",
+      "week": "2026-03-02",
       "theme_or_sector": "Financial Services",
       "thesis": "섹터 약세/리스크 확대",
-      "evidence": "RS 평균 39.8, 3M 평균수익률 -0.68%",
+      "evidence": "RS 평균 41.5, 3M 평균수익률 -3.69%",
       "risk": "숏커버링/정책 변화 시 급반등 가능",
       "confidence": 0.72,
       "source_url": "https://finance.yahoo.com/"
     },
     {
-      "week": "2026-02-23",
+      "week": "2026-03-02",
       "theme_or_sector": "Unknown",
       "thesis": "섹터 약세/리스크 확대",
-      "evidence": "RS 평균 3.0, 3M 평균수익률 +2.45%",
+      "evidence": "RS 평균 2.0, 3M 평균수익률 -4.48%",
       "risk": "숏커버링/정책 변화 시 급반등 가능",
       "confidence": 0.72,
       "source_url": "https://finance.yahoo.com/"
