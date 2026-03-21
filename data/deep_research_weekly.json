@@ -1,56 +1,56 @@
 {
-  "updated_at": "2026-03-14T05:06:05.093443Z",
+  "updated_at": "2026-03-21T05:00:04.122347Z",
   "records": [
     {
-      "week": "2026-03-09",
+      "week": "2026-03-16",
       "theme_or_sector": "Energy",
       "thesis": "섹터 리더십 유지 가능성",
-      "evidence": "RS 평균 84.4, 3M 평균수익률 +25.30%",
+      "evidence": "RS 평균 87.8, 3M 평균수익률 +36.21%",
       "risk": "실적 시즌 변동성/밸류에이션 부담",
       "confidence": 0.75,
       "source_url": "https://finance.yahoo.com/"
     },
     {
-      "week": "2026-03-09",
+      "week": "2026-03-16",
       "theme_or_sector": "Utilities",
       "thesis": "섹터 리더십 유지 가능성",
-      "evidence": "RS 평균 70.6, 3M 평균수익률 +11.87%",
+      "evidence": "RS 평균 64.8, 3M 평균수익률 +5.38%",
       "risk": "실적 시즌 변동성/밸류에이션 부담",
       "confidence": 0.75,
       "source_url": "https://finance.yahoo.com/"
     },
     {
-      "week": "2026-03-09",
+      "week": "2026-03-16",
       "theme_or_sector": "Basic Materials",
       "thesis": "섹터 리더십 유지 가능성",
-      "evidence": "RS 평균 66.7, 3M 평균수익률 +14.17%",
+      "evidence": "RS 평균 63.9, 3M 평균수익률 +10.37%",
       "risk": "실적 시즌 변동성/밸류에이션 부담",
       "confidence": 0.75,
       "source_url": "https://finance.yahoo.com/"
     },
     {
-      "week": "2026-03-09",
-      "theme_or_sector": "Healthcare",
+      "week": "2026-03-16",
+      "theme_or_sector": "Consumer Cyclical",
       "thesis": "섹터 약세/리스크 확대",
-      "evidence": "RS 평균 44.1, 3M 평균수익률 -5.00%",
+      "evidence": "RS 평균 42.2, 3M 평균수익률 -8.72%",
       "risk": "숏커버링/정책 변화 시 급반등 가능",
       "confidence": 0.72,
       "source_url": "https://finance.yahoo.com/"
     },
     {
-      "week": "2026-03-09",
+      "week": "2026-03-16",
       "theme_or_sector": "Financial Services",
       "thesis": "섹터 약세/리스크 확대",
-      "evidence": "RS 평균 39.6, 3M 평균수익률 -9.84%",
+      "evidence": "RS 평균 41.8, 3M 평균수익률 -9.24%",
       "risk": "숏커버링/정책 변화 시 급반등 가능",
       "confidence": 0.72,
       "source_url": "https://finance.yahoo.com/"
     },
     {
-      "week": "2026-03-09",
+      "week": "2026-03-16",
       "theme_or_sector": "Unknown",
       "thesis": "섹터 약세/리스크 확대",
-      "evidence": "RS 평균 1.0, 3M 평균수익률 -16.75%",
+      "evidence": "RS 평균 1.0, 3M 평균수익률 -16.07%",
       "risk": "숏커버링/정책 변화 시 급반등 가능",
       "confidence": 0.72,
       "source_url": "https://finance.yahoo.com/"
